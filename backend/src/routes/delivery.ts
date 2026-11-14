@@ -1,0 +1,35 @@
+import { Router } from 'express';
+import { PharmacyOrder } from '../models/PharmacyOrder';
+import { requireAuth, AuthenticatedRequest, requireRole } from '../middleware/auth';
+import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realtime/socket';
+import { successResponse } from '../utils/response';
+
+const router = Router();
+
+router.get('/assignments', requireAuth, requireRole('deliveryBoy', 'admin'), async (req: AuthenticatedRequest, res) => {
+  const filter = req.user?.role === 'admin' ? {} : { assignedDeliveryId: req.user?.id };
+  const assignments = await PharmacyOrder.find({ ...filter, status: { $in: ['OUT_FOR_DELIVERY', 'DELIVERED'] } })
+    .select('patientId deliveryAddress status assignedDeliveryId createdAt items.name items.quantity')
+    .populate('patientId', 'name phone')
+    .sort({ createdAt: -1 })
+    .lean();
+  return res.json(successResponse('Assigned deliveries loaded.', assignments));
+});
+
+router.patch('/assignments/:id/complete', requireAuth, requireRole('deliveryBoy', 'admin'), async (req: AuthenticatedRequest, res) => {
+  const filter = req.user?.role === 'admin'
+    ? { _id: req.params.id, status: 'OUT_FOR_DELIVERY' }
+    : { _id: req.params.id, assignedDeliveryId: req.user?.id, status: 'OUT_FOR_DELIVERY' };
+  const order = await PharmacyOrder.findOneAndUpdate(filter, { $set: { status: 'DELIVERED' } }, { new: true });
+  if (!order) {
+    return res.status(404).json({ success: false, message: 'Active delivery assignment not found.' });
+  }
+
+  const event = { pharmacyOrderId: order.id, patientId: order.patientId.toString(), status: order.status };
+  publishUserEvent(order.patientId.toString(), 'delivery.completed', event);
+  publishRoleEvent('pharmacist', 'delivery.completed', event);
+  publishAdminEvent('delivery.completed', event);
+  return res.json(successResponse('Delivery marked complete.', order));
+});
+
+export default router;
