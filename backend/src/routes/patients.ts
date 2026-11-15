@@ -1,12 +1,13 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { Appointment } from '../models/Appointment';
+import { Appointment, type AppointmentDocument } from '../models/Appointment';
 import { Department, Doctor } from '../models/Clinic';
 import { Payment, type PaymentDocument } from '../models/Payment';
 import { PharmacyOrder } from '../models/PharmacyOrder';
 import { User } from '../models/User';
 import { requireAuth, AuthenticatedRequest, requireRole } from '../middleware/auth';
 import { env } from '../config/env';
+import { cacheKeys, getOrLoadCache } from '../services/redisCache';
 import { getRazorpayClient, PaymentConfigurationError } from '../services/razorpay';
 import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realtime/socket';
 import { successResponse } from '../utils/response';
@@ -15,6 +16,7 @@ import { queueAppointmentReminder } from '../services/notifications';
 import { recordAudit } from '../utils/audit';
 import { requestFullRefund } from '../services/refunds';
 import { clinicDateTimeToDate, getClinicDate, getClinicSlots, isValidClinicDate } from '../utils/clinicSchedule';
+import { withRedisLock } from '../utils/redisLock';
 
 const router = Router();
 
@@ -22,12 +24,14 @@ const isDuplicateKeyError = (error: unknown) =>
   typeof error === 'object' && error !== null && 'code' in error && error.code === 11000;
 
 router.get('/departments', requireAuth, async (_req, res) => {
-  const departments = await Department.find().sort({ name: 1 }).lean();
+  const departments = await getOrLoadCache(cacheKeys.departments, 300, () =>
+    Department.find().sort({ name: 1 }).lean());
   return res.json(successResponse('Departments fetched.', departments));
 });
 
 router.get('/doctors', requireAuth, async (_req, res) => {
-  const doctors = await Doctor.find().select('_id name specialization department fee').sort({ name: 1 }).lean();
+  const doctors = await getOrLoadCache(cacheKeys.doctors, 120, () =>
+    Doctor.find().select('_id name specialization department fee').sort({ name: 1 }).lean());
   return res.json(successResponse('Doctors fetched.', doctors));
 });
 
@@ -40,12 +44,19 @@ router.get('/doctors/:doctorId/slots', requireAuth, requireRole('patient'), asyn
   if (date.data < getClinicDate(new Date())) {
     return res.status(400).json({ success: false, message: 'Appointment dates must be today or later.' });
   }
-  const doctor = await Doctor.findById(doctorId.data).select('weeklyAvailability');
-  if (!doctor) {
+  const weeklyAvailability = await getOrLoadCache(
+    cacheKeys.doctorAvailability(doctorId.data),
+    60,
+    async () => {
+      const doctor = await Doctor.findById(doctorId.data).select('weeklyAvailability').lean();
+      return doctor?.weeklyAvailability || null;
+    },
+  );
+  if (!weeklyAvailability) {
     return res.status(404).json({ success: false, message: 'Doctor not found.' });
   }
 
-  const slots = getClinicSlots(date.data, new Date(), doctor.weeklyAvailability || []);
+  const slots = getClinicSlots(date.data, new Date(), weeklyAvailability);
   const appointments = slots.length
     ? await Appointment.find({
       doctorId: doctorId.data,
@@ -167,32 +178,59 @@ router.post('/appointments', requireAuth, requireRole('patient'), async (req: Au
     return res.status(404).json({ success: false, message: 'Doctor not found.' });
   }
 
-  if (await Appointment.exists({
-    doctorId: doctor.id,
-    slot,
-    status: { $in: ['REQUESTED', 'PAYMENT_PENDING', 'CONFIRMED'] },
-  })) {
-    return res.status(409).json({ success: false, message: 'That appointment slot is no longer available.' });
+  let createdAppointment: AppointmentDocument | undefined;
+  const availableSlots = getClinicSlots(
+    parsed.data.date,
+    new Date(),
+    (await getOrLoadCache(cacheKeys.doctorAvailability(doctor.id), 60, async () => {
+      const currentDoctor = await Doctor.findById(doctor.id).select('weeklyAvailability').lean();
+      return currentDoctor?.weeklyAvailability || null;
+    })) || [],
+  );
+  if (!availableSlots.some(({ slot: availableSlot }) => availableSlot.getTime() === slot.getTime())) {
+    return res.status(409).json({ success: false, message: "That time is outside the doctor's available schedule." });
   }
 
-  let appointment;
+  let appointment: AppointmentDocument | null | undefined;
   try {
-    appointment = await Appointment.create({
-      patientId: req.user?.id,
-      doctorId: doctor.id,
-      doctorName: doctor.name,
-      department: doctor.department,
-      slot,
-      fee: doctor.fee,
-      status: 'PAYMENT_PENDING',
-      consultationType: parsed.data.consultationType,
-    });
+    appointment = await withRedisLock(
+      `medsync:v1:lock:appointment:${doctor.id}:${slot.getTime()}`,
+      15_000,
+      async () => {
+        if (await Appointment.exists({
+          doctorId: doctor.id,
+          slot,
+          status: { $in: ['REQUESTED', 'PAYMENT_PENDING', 'CONFIRMED'] },
+        })) return null;
+        createdAppointment = await Appointment.create({
+          patientId: req.user?.id,
+          doctorId: doctor.id,
+          doctorName: doctor.name,
+          department: doctor.department,
+          slot,
+          fee: doctor.fee,
+          status: 'PAYMENT_PENDING',
+          consultationType: parsed.data.consultationType,
+        });
+        return createdAppointment;
+      },
+    );
   } catch (error) {
+    if (createdAppointment) {
+      await Appointment.deleteOne({ _id: createdAppointment._id, status: 'PAYMENT_PENDING' });
+    }
     if (isDuplicateKeyError(error)) {
       return res.status(409).json({ success: false, message: 'That appointment slot is no longer available.' });
     }
     throw error;
   }
+  if (appointment === undefined) {
+    return res.status(409).json({ success: false, message: 'This appointment slot is being reserved. Please try again.' });
+  }
+  if (!appointment) {
+    return res.status(409).json({ success: false, message: 'That appointment slot is no longer available.' });
+  }
+  const appointmentId = appointment._id.toString();
 
   let payment: PaymentDocument;
   try {
@@ -203,12 +241,12 @@ router.post('/appointments', requireAuth, requireRole('patient'), async (req: Au
     const order = await getRazorpayClient().orders.create({
       amount: amountPaise,
       currency: 'INR',
-      receipt: appointment.id,
-      notes: { appointmentId: appointment.id, patientId: req.user?.id || '' },
+      receipt: appointmentId,
+      notes: { appointmentId, patientId: req.user?.id || '' },
     });
     payment = await Payment.create({
       patientId: req.user?.id,
-      appointmentId: appointment.id,
+      appointmentId,
       providerOrderId: order.id,
       amountPaise,
       currency: 'INR',
@@ -224,7 +262,7 @@ router.post('/appointments', requireAuth, requireRole('patient'), async (req: Au
   }
 
   const appointmentEvent = {
-    appointmentId: appointment.id,
+    appointmentId,
     patientId: appointment.patientId.toString(),
     status: appointment.status,
     slot: appointment.slot.toISOString(),
@@ -236,7 +274,7 @@ router.post('/appointments', requireAuth, requireRole('patient'), async (req: Au
     title: 'Appointment booked',
     message: `Your appointment with ${doctor.name} is reserved for ${appointmentTime}. Complete payment to confirm it.`,
     metadata: appointmentEvent,
-    dedupeKey: `appointment-booked:${appointment.id}`,
+    dedupeKey: `appointment-booked:${appointmentId}`,
     email: {
       subject: 'Your MedSync appointment is booked',
       text: `Your appointment with ${doctor.name} is reserved for ${appointmentTime}. Complete payment to confirm it.`,
@@ -247,7 +285,7 @@ router.post('/appointments', requireAuth, requireRole('patient'), async (req: Au
     title: 'New appointment request',
     message: `${patient?.name || 'A patient'} requested an appointment for ${appointmentTime}.`,
     metadata: appointmentEvent,
-    dedupeKey: `appointment-requested:${appointment.id}`,
+    dedupeKey: `appointment-requested:${appointmentId}`,
     email: {
       subject: 'New MedSync appointment request',
       text: `${patient?.name || 'A patient'} requested an appointment with you for ${appointmentTime}.`,

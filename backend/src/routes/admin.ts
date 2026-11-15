@@ -14,6 +14,8 @@ import { hashPassword } from '../utils/password';
 import { recordAudit } from '../utils/audit';
 import { requestFullRefund } from '../services/refunds';
 import { notifyRole } from '../services/userNotifications';
+import { cacheKeys, invalidateCache } from '../services/redisCache';
+import { revokeSessionFamilies } from '../services/redisSessions';
 
 const router = Router();
 
@@ -102,7 +104,9 @@ router.post('/users', requireAuth, requireRole('admin'), async (req: Authenticat
       await User.deleteOne({ _id: user.id });
       throw error;
     }
+    await invalidateCache(cacheKeys.doctors);
   }
+  if (role === 'deliveryBoy') await invalidateCache(cacheKeys.deliveryStaff);
 
   await recordAudit(req, {
     action: 'admin.staff_created',
@@ -149,8 +153,11 @@ router.patch('/users/:id/status', requireAuth, requireRole('admin'), async (req:
   if (!parsed.data.isActive) {
     const activeFamilies = await AuthSession.find({ userId: user._id, revokedAt: { $exists: false } }).distinct('familyId');
     await AuthSession.updateMany({ familyId: { $in: activeFamilies }, revokedAt: { $exists: false } }, { $set: { revokedAt: new Date() } });
+    await revokeSessionFamilies(activeFamilies);
     for (const familyId of activeFamilies) disconnectSessionFamily(familyId);
   }
+  if (user.role === 'doctor') await invalidateCache(cacheKeys.doctors);
+  if (user.role === 'deliveryBoy') await invalidateCache(cacheKeys.deliveryStaff);
 
   await recordAudit(req, {
     action: 'admin.user_status_updated',
@@ -191,6 +198,7 @@ router.post('/departments', requireAuth, requireRole('admin'), async (req: Authe
   }
   try {
     const department = await Department.create(parsed.data);
+    await invalidateCache(cacheKeys.departments);
     await recordAudit(req, {
       action: 'admin.department_created',
       entityType: 'department',
@@ -222,6 +230,7 @@ router.patch('/departments/:id', requireAuth, requireRole('admin'), async (req: 
     if (!department) {
       return res.status(404).json({ success: false, message: 'Department not found.' });
     }
+    await invalidateCache(cacheKeys.departments);
     await recordAudit(req, {
       action: 'admin.department_updated',
       entityType: 'department',
@@ -248,6 +257,7 @@ router.delete('/departments/:id', requireAuth, requireRole('admin'), async (req:
     return res.status(409).json({ success: false, message: 'Reassign doctors before deleting this department.' });
   }
   await Department.deleteOne({ _id: department._id });
+  await invalidateCache(cacheKeys.departments);
   await recordAudit(req, {
     action: 'admin.department_deleted',
     entityType: 'department',

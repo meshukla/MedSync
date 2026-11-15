@@ -2,6 +2,7 @@ import { InventoryItem } from '../models/Clinic';
 import type { Types } from 'mongoose';
 import type { PharmacyOrderDocument } from '../models/PharmacyOrder';
 import { notifyRole } from './userNotifications';
+import { cacheKeys, invalidateCache } from './redisCache';
 
 type DeductionResult = { success: true } | { success: false; message: string };
 
@@ -12,6 +13,7 @@ const rollbackDeductions = async (deductions: { inventoryId: string; quantity: n
       { $inc: { stock: deduction.quantity }, $pull: { deductedOrderIds: deduction.orderId } },
     );
   }
+  if (deductions.length > 0) await invalidateCache(cacheKeys.pharmacyInventory);
 };
 
 export const deductOrderInventory = async (order: PharmacyOrderDocument): Promise<DeductionResult> => {
@@ -62,6 +64,7 @@ export const deductOrderInventory = async (order: PharmacyOrderDocument): Promis
     };
   }
 
+  if (newlyDeducted.length > 0) await invalidateCache(cacheKeys.pharmacyInventory);
   for (const item of lowStock) {
     await notifyRole('admin', {
       event: 'inventory.low-stock',
@@ -79,8 +82,9 @@ export const deductOrderInventory = async (order: PharmacyOrderDocument): Promis
 };
 
 export const clearOrderInventoryDeductions = async (orderId: string) => {
-  await InventoryItem.updateMany(
+  const result = await InventoryItem.updateMany(
     { deductedOrderIds: orderId },
     { $pull: { deductedOrderIds: orderId } },
   );
+  if (result.modifiedCount > 0) await invalidateCache(cacheKeys.pharmacyInventory);
 };

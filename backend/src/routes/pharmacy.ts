@@ -11,6 +11,7 @@ import { recordAudit } from '../utils/audit';
 import { verifyPrescriptionSignature } from '../utils/prescriptionSignature';
 import { successResponse } from '../utils/response';
 import { notifyRole, notifyUsers } from '../services/userNotifications';
+import { cacheKeys, getOrLoadCache, invalidateCache } from '../services/redisCache';
 
 const router = Router();
 
@@ -24,7 +25,8 @@ router.get('/orders', requireAuth, requireRole('pharmacist', 'admin'), async (_r
 });
 
 router.get('/delivery-staff', requireAuth, requireRole('pharmacist', 'admin'), async (_req, res) => {
-  const deliveryStaff = await User.find({ role: 'deliveryBoy', isActive: true }).select('_id name').sort({ name: 1 }).lean();
+  const deliveryStaff = await getOrLoadCache(cacheKeys.deliveryStaff, 120, () =>
+    User.find({ role: 'deliveryBoy', isActive: true }).select('_id name').sort({ name: 1 }).lean());
   return res.json(successResponse('Delivery staff loaded.', deliveryStaff));
 });
 
@@ -248,11 +250,11 @@ router.post('/orders/:id/collect', requireAuth, requireRole('pharmacist', 'admin
 });
 
 router.get('/inventory', requireAuth, requireRole('pharmacist', 'admin'), async (_req, res) => {
-  const inventory = await InventoryItem.find().sort({ medicine: 1 }).lean();
-  return res.json(successResponse('Inventory loaded.', inventory.map((item) => ({
-    ...item,
-    lowStock: item.stock <= item.lowStockThreshold,
-  }))));
+  const inventory = await getOrLoadCache(cacheKeys.pharmacyInventory, 30, async () => {
+    const items = await InventoryItem.find().sort({ medicine: 1 }).lean();
+    return items.map((item) => ({ ...item, lowStock: item.stock <= item.lowStockThreshold }));
+  });
+  return res.json(successResponse('Inventory loaded.', inventory));
 });
 
 const createInventorySchema = z.object({
@@ -279,6 +281,7 @@ router.post('/inventory', requireAuth, requireRole('pharmacist', 'admin'), async
     }
     throw error;
   }
+  await invalidateCache(cacheKeys.pharmacyInventory);
   await recordAudit(req, {
     action: 'pharmacy.inventory_created',
     entityType: 'inventoryItem',
@@ -322,6 +325,7 @@ router.patch('/inventory/:id', requireAuth, requireRole('pharmacist', 'admin'), 
   if (!item) {
     return res.status(409).json({ success: false, message: 'Inventory stock changed. Refresh and try again.' });
   }
+  await invalidateCache(cacheKeys.pharmacyInventory);
 
   await recordAudit(req, {
     action: 'pharmacy.inventory_adjusted',
@@ -362,6 +366,7 @@ router.patch('/inventory/:id/restock', requireAuth, requireRole('pharmacist', 'a
     { new: true },
   );
   if (!item) return res.status(404).json({ success: false, message: 'Inventory item not found.' });
+  await invalidateCache(cacheKeys.pharmacyInventory);
   await recordAudit(req, {
     action: 'pharmacy.inventory_restocked',
     entityType: 'inventoryItem',

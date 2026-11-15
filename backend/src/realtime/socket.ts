@@ -3,7 +3,6 @@ import { Server as HttpServer } from 'node:http';
 import jwt, { JsonWebTokenError, TokenExpiredError } from 'jsonwebtoken';
 import { z } from 'zod';
 import { env } from '../config/env';
-import { AuthSession } from '../models/AuthSession';
 import { Appointment } from '../models/Appointment';
 import { Doctor } from '../models/Clinic';
 import { Payment } from '../models/Payment';
@@ -11,6 +10,7 @@ import { User } from '../models/User';
 import { getVideoIceServers } from './videoIceServers';
 import { accessCookieName, getTabSessionId } from '../utils/tabSession';
 import { notifyUsers } from '../services/userNotifications';
+import { hasActiveSessionFamily } from '../services/redisSessions';
 
 type SocketUser = { id: string; role: string; familyId: string };
 type VideoRole = 'patient' | 'doctor';
@@ -87,11 +87,7 @@ export const initializeRealtime = (httpServer: HttpServer) => {
     try {
       [user, activeSession] = await Promise.all([
         User.findById(payload.id).select('_id role isActive'),
-        AuthSession.exists({
-          familyId: payload.familyId,
-          revokedAt: { $exists: false },
-          expiresAt: { $gt: new Date() },
-        }),
+        hasActiveSessionFamily(payload.familyId),
       ]);
     } catch (error) {
       next(error instanceof Error ? error : new Error('Socket authentication failed.'));

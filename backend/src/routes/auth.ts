@@ -5,10 +5,19 @@ import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { env } from '../config/env';
 import { AuthSession } from '../models/AuthSession';
-import { OtpRecord } from '../models/OtpRecord';
 import { User } from '../models/User';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth';
+import { rateLimit } from '../middleware/rateLimit';
 import { sendVerificationEmail } from '../services/email';
+import {
+  beginOtpAttempt,
+  consumeOtp,
+  invalidateOtp,
+  otpRateLimitRedisKey,
+  otpRedisKey,
+  storeOtp,
+} from '../services/redisOtp';
+import { cacheActiveSessionFamily, revokeSessionFamilies } from '../services/redisSessions';
 import { disconnectSessionFamily, publishAdminEvent } from '../realtime/socket';
 import { accessCookieName, getTabSessionId, refreshCookieName, TAB_SESSION_HEADER } from '../utils/tabSession';
 import { successResponse } from '../utils/response';
@@ -24,7 +33,6 @@ const OTP_MAX_SENDS_PER_WINDOW = 5;
 const OTP_MAX_ATTEMPTS = 5;
 const ACCESS_TOKEN_LIFETIME_MS = 15 * 60 * 1000;
 const REFRESH_TOKEN_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
-const OTP_PURPOSE = 'EMAIL_VERIFICATION' as const;
 
 class EmailDeliveryError extends Error {}
 
@@ -83,64 +91,37 @@ const hashRefreshToken = (token: string) => createHash('sha256').update(token).d
 const hashOtp = (email: string, code: string) =>
   createHmac('sha256', env.jwtAccessSecret).update(`${email}:${code}`).digest('hex');
 
+const otpSendRateLimit = rateLimit({
+  name: 'otp-send',
+  limit: 3,
+  windowMs: 10 * 60 * 1000,
+  identityField: 'email',
+});
+
 const sendOtp = async (email: string) => {
-  const now = new Date();
+  const now = Date.now();
   const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
-  const existing = await OtpRecord.findOne({ email, purpose: OTP_PURPOSE });
-
-  if (existing && now.getTime() - existing.sentAt.getTime() < OTP_RESEND_COOLDOWN_MS) {
-    return false;
-  }
-
-  const windowExpired = !existing || now.getTime() - existing.windowStartedAt.getTime() >= OTP_SEND_WINDOW_MS;
-  if (existing && !windowExpired && existing.sendCount >= OTP_MAX_SENDS_PER_WINDOW) {
-    return false;
-  }
-
-  if (existing) {
-    const updated = await OtpRecord.updateOne(
-      {
-        _id: existing._id,
-        sendCount: existing.sendCount,
-        sentAt: existing.sentAt,
-        consumedAt: existing.consumedAt ?? null,
-      },
-      {
-        $set: {
-          codeHash: hashOtp(email, code),
-          expiresAt: new Date(now.getTime() + OTP_LIFETIME_MS),
-          attempts: 0,
-          sentAt: now,
-          windowStartedAt: windowExpired ? now : existing.windowStartedAt,
-          sendCount: windowExpired ? 1 : existing.sendCount + 1,
-          consumedAt: null,
-        },
-      },
-    );
-    if (updated.modifiedCount !== 1) return false;
-  } else {
-    try {
-      await OtpRecord.create({
-        email,
-        purpose: OTP_PURPOSE,
-        codeHash: hashOtp(email, code),
-        expiresAt: new Date(now.getTime() + OTP_LIFETIME_MS),
-        attempts: 0,
-        sentAt: now,
-        windowStartedAt: now,
-        sendCount: 1,
-      });
-    } catch (error) {
-      if (isDuplicateKeyError(error)) return false;
-      throw error;
-    }
-  }
+  const codeHash = hashOtp(email, code);
+  const key = otpRedisKey(email);
+  const stored = await storeOtp({
+    key,
+    rateKey: otpRateLimitRedisKey(email),
+    codeHash,
+    now,
+    expiresAt: now + OTP_LIFETIME_MS,
+    cooldownMs: OTP_RESEND_COOLDOWN_MS,
+    windowMs: OTP_SEND_WINDOW_MS,
+    maxSends: OTP_MAX_SENDS_PER_WINDOW,
+    ttlSeconds: Math.ceil(OTP_LIFETIME_MS / 1000),
+    rateTtlSeconds: Math.ceil(OTP_SEND_WINDOW_MS / 1000),
+  });
+  if (stored !== 1) return false;
 
   try {
     await sendVerificationEmail(email, code);
   } catch (error) {
     console.error('Verification email delivery failed:', error instanceof Error ? error.message : 'Unknown email error.');
-    await OtpRecord.deleteOne({ email, purpose: OTP_PURPOSE, codeHash: hashOtp(email, code) });
+    await invalidateOtp(key, codeHash);
     throw new EmailDeliveryError('Verification email delivery failed.');
   }
   return true;
@@ -160,15 +141,13 @@ const createSession = async (userId: string, familyId: string, expiresAt: Date) 
 const issueSession = async (res: Response, userId: string, tabSessionId: string) => {
   const now = new Date();
   const familyId = randomUUID();
-  const refreshToken = await createSession(
-    userId,
-    familyId,
-    new Date(now.getTime() + REFRESH_TOKEN_LIFETIME_MS),
-  );
+  const expiresAt = new Date(now.getTime() + REFRESH_TOKEN_LIFETIME_MS);
+  const refreshToken = await createSession(userId, familyId, expiresAt);
+  await cacheActiveSessionFamily(familyId, expiresAt);
   setAuthCookies(res, tabSessionId, createAccessToken(userId, familyId), refreshToken);
 };
 
-router.post('/register', async (req, res) => {
+router.post('/register', otpSendRateLimit, async (req, res) => {
   const parsed = registerSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ success: false, message: 'Invalid registration payload.', details: parsed.error.flatten() });
@@ -240,7 +219,7 @@ router.post('/register', async (req, res) => {
   }));
 });
 
-router.post('/otp/resend', async (req, res) => {
+router.post('/otp/resend', otpSendRateLimit, async (req, res) => {
   const parsed = emailSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ success: false, message: 'Enter a valid email address.' });
@@ -265,47 +244,38 @@ router.post('/otp/resend', async (req, res) => {
   return res.status(202).json(successResponse('If the account needs verification, a code has been sent.'));
 });
 
-router.post('/otp/verify', async (req, res) => {
+router.post('/otp/verify', rateLimit({
+  name: 'otp-verify',
+  limit: 10,
+  windowMs: 10 * 60 * 1000,
+  identityField: 'email',
+}), async (req, res) => {
   const parsed = verifyOtpSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ success: false, message: 'Enter a valid email and six-digit code.' });
   }
 
   const email = parsed.data.email.toLowerCase();
-  const now = new Date();
-  const otp = await OtpRecord.findOneAndUpdate(
-    {
-      email,
-      purpose: OTP_PURPOSE,
-      expiresAt: { $gt: now },
-      attempts: { $lt: OTP_MAX_ATTEMPTS },
-      consumedAt: null,
-    },
-    { $inc: { attempts: 1 } },
-    { new: true },
-  ).select('+codeHash');
-
-  if (!otp) {
+  const now = Date.now();
+  const key = otpRedisKey(email);
+  const codeHash = await beginOtpAttempt(key, now, OTP_MAX_ATTEMPTS);
+  if (!codeHash) {
     return res.status(400).json({ success: false, message: 'The verification code is invalid or expired.' });
   }
 
   const submittedHash = Buffer.from(hashOtp(email, parsed.data.code), 'hex');
-  const storedHash = Buffer.from(otp.codeHash, 'hex');
+  const storedHash = Buffer.from(codeHash, 'hex');
   if (!timingSafeEqual(submittedHash, storedHash)) {
     return res.status(400).json({ success: false, message: 'The verification code is invalid or expired.' });
   }
 
-  const consumed = await OtpRecord.updateOne(
-    { _id: otp._id, attempts: otp.attempts, consumedAt: null },
-    { $set: { consumedAt: now } },
-  );
-  if (consumed.modifiedCount !== 1) {
+  if (!await consumeOtp(key, codeHash, now, OTP_MAX_ATTEMPTS)) {
     return res.status(400).json({ success: false, message: 'The verification code is invalid or expired.' });
   }
 
   const user = await User.findOneAndUpdate(
     { email, role: 'patient', emailVerifiedAt: { $exists: false } },
-    { $set: { emailVerifiedAt: now } },
+    { $set: { emailVerifiedAt: new Date(now) } },
     { new: true },
   );
   if (!user) {
@@ -331,7 +301,12 @@ router.post('/otp/verify', async (req, res) => {
   return res.json(successResponse('Email verified. You can now sign in.'));
 });
 
-router.post('/login', async (req, res) => {
+router.post('/login', rateLimit({
+  name: 'login',
+  limit: 5,
+  windowMs: 15 * 60 * 1000,
+  identityField: 'email',
+}), async (req, res) => {
   const tabSessionId = getTabSessionId(req.header(TAB_SESSION_HEADER));
   if (!tabSessionId) {
     return res.status(400).json({ success: false, message: 'A valid browser-tab session ID is required. Reload the page and try again.' });
@@ -378,6 +353,7 @@ router.post('/refresh', async (req, res) => {
 
   if (session.revokedAt) {
     await AuthSession.updateMany({ familyId: session.familyId, revokedAt: { $exists: false } }, { $set: { revokedAt: new Date() } });
+    await revokeSessionFamilies([session.familyId]);
     disconnectSessionFamily(session.familyId);
     clearAuthCookies(res, tabSessionId);
     return res.status(401).json({ success: false, message: 'Refresh session reuse detected. Please sign in again.' });
@@ -392,6 +368,7 @@ router.post('/refresh', async (req, res) => {
   const user = await User.findById(session.userId).select('_id isActive');
   if (!user || !user.isActive) {
     await AuthSession.updateMany({ familyId: session.familyId, revokedAt: { $exists: false } }, { $set: { revokedAt: now } });
+    await revokeSessionFamilies([session.familyId]);
     disconnectSessionFamily(session.familyId);
     clearAuthCookies(res, tabSessionId);
     return res.status(401).json({ success: false, message: 'User account is unavailable.' });
@@ -412,11 +389,13 @@ router.post('/refresh', async (req, res) => {
   if (!rotated) {
     await AuthSession.deleteOne({ tokenHash: nextHash });
     await AuthSession.updateMany({ familyId: session.familyId, revokedAt: { $exists: false } }, { $set: { revokedAt: now } });
+    await revokeSessionFamilies([session.familyId]);
     disconnectSessionFamily(session.familyId);
     clearAuthCookies(res, tabSessionId);
     return res.status(401).json({ success: false, message: 'Refresh session was already used. Please sign in again.' });
   }
 
+  await cacheActiveSessionFamily(session.familyId, session.expiresAt);
   setAuthCookies(
     res,
     tabSessionId,
@@ -436,6 +415,7 @@ router.post('/logout', async (req, res) => {
     const session = await AuthSession.findOne({ tokenHash: hashRefreshToken(refreshToken) });
     if (session && !session.revokedAt) {
       await AuthSession.updateMany({ familyId: session.familyId, revokedAt: { $exists: false } }, { $set: { revokedAt: new Date() } });
+      await revokeSessionFamilies([session.familyId]);
       disconnectSessionFamily(session.familyId);
     }
   }

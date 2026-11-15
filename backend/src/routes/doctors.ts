@@ -8,6 +8,7 @@ import { Prescription } from '../models/Prescription';
 import { User } from '../models/User';
 import { env } from '../config/env';
 import { requireAuth, AuthenticatedRequest, requireRole } from '../middleware/auth';
+import { cacheKeys, invalidateCache } from '../services/redisCache';
 import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realtime/socket';
 import {
   queueAppointmentConfirmation,
@@ -67,6 +68,7 @@ router.put('/availability', requireAuth, requireRole('doctor'), async (req: Auth
   if (!doctor) {
     return res.status(404).json({ success: false, message: 'Doctor profile not found.' });
   }
+  await invalidateCache(cacheKeys.doctorAvailability(doctor.id));
   await recordAudit(req, {
     action: 'doctor.availability_updated',
     entityType: 'doctor',

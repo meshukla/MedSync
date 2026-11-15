@@ -1,8 +1,8 @@
 import { NextFunction, Request, Response } from 'express';
 import jwt, { JsonWebTokenError, TokenExpiredError } from 'jsonwebtoken';
 import { env } from '../config/env';
-import { AuthSession } from '../models/AuthSession';
 import { User, UserRole } from '../models/User';
+import { hasActiveSessionFamily } from '../services/redisSessions';
 import { accessCookieName, getTabSessionId, TAB_SESSION_HEADER } from '../utils/tabSession';
 
 export type AuthenticatedRequest = Request & {
@@ -39,11 +39,7 @@ export const requireAuth = async (req: AuthenticatedRequest, res: Response, next
 
   const [user, activeSession] = await Promise.all([
     User.findById(payload.id).select('_id role email isActive'),
-    AuthSession.exists({
-      familyId: payload.familyId,
-      revokedAt: { $exists: false },
-      expiresAt: { $gt: new Date() },
-    }),
+    hasActiveSessionFamily(payload.familyId),
   ]);
   if (!user || !user.isActive || !activeSession) {
     return res.status(401).json({ success: false, message: 'User account is unavailable.' });
