@@ -9,6 +9,7 @@ import { Doctor } from '../models/Clinic';
 import { Payment } from '../models/Payment';
 import { User } from '../models/User';
 import { getVideoIceServers } from './videoIceServers';
+import { accessCookieName, getTabSessionId } from '../utils/tabSession';
 
 type SocketUser = { id: string; role: string; familyId: string };
 type VideoRole = 'patient' | 'doctor';
@@ -48,10 +49,16 @@ export const initializeRealtime = (httpServer: HttpServer) => {
   });
 
   io.use(async (socket, next) => {
+    const tabSessionId = getTabSessionId(socket.handshake.auth?.tabSessionId);
+    if (!tabSessionId) {
+      next(new Error('A valid browser-tab session ID is required.'));
+      return;
+    }
+    const accessCookie = accessCookieName(tabSessionId);
     const cookieHeader = socket.handshake.headers.cookie || '';
     const tokenPart = cookieHeader.split(';').map((part) => part.trim())
-      .find((part) => part.startsWith('medsyncAccessToken='));
-    const token = tokenPart?.slice('medsyncAccessToken='.length);
+      .find((part) => part.startsWith(`${accessCookie}=`));
+    const token = tokenPart?.slice(`${accessCookie}=`.length);
     if (!token) {
       next(new Error('Authentication required.'));
       return;
@@ -102,9 +109,7 @@ export const initializeRealtime = (httpServer: HttpServer) => {
     const user = socket.data.user as SocketUser;
     socket.join(`user:${user.id}`);
     socket.join(`session:${user.familyId}`);
-    if (user.role === 'admin' || user.role === 'pharmacist' || user.role === 'deliveryBoy') {
-      socket.join(`role:${user.role}`);
-    }
+    socket.join(`role:${user.role}`);
 
     const leaveVideoRoom = () => {
       const appointmentId = socket.data.videoAppointmentId as string | undefined;
@@ -298,7 +303,11 @@ export const publishAdminEvent = (event: string, payload: Record<string, unknown
   io.to('role:admin').emit('medsync:event', { event, ...payload });
 };
 
-export const publishRoleEvent = (role: 'pharmacist' | 'deliveryBoy', event: string, payload: Record<string, unknown>) => {
+export const publishRoleEvent = (
+  role: 'patient' | 'doctor' | 'admin' | 'pharmacist' | 'deliveryBoy',
+  event: string,
+  payload: Record<string, unknown>,
+) => {
   if (!io) throw new Error('Realtime service has not been initialized.');
   io.to(`role:${role}`).emit('medsync:event', { event, ...payload });
 };

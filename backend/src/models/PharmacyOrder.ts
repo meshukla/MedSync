@@ -32,7 +32,9 @@ export type PharmacyOrderDocument = {
     instructions?: string;
   }[];
   assignedDeliveryId?: Types.ObjectId;
-  deliveryOtpHash?: string;
+  stockDeductedAt?: Date;
+  deliveredAt?: Date;
+  collectedAt?: Date;
   createdAt: Date;
 };
 
@@ -54,7 +56,9 @@ const pharmacyOrderSchema = new Schema<PharmacyOrderDocument>(
       instructions: { type: String, trim: true, maxlength: 1000 },
     }],
     assignedDeliveryId: { type: Schema.Types.ObjectId, ref: 'User' },
-    deliveryOtpHash: { type: String, select: false },
+    stockDeductedAt: { type: Date },
+    deliveredAt: { type: Date },
+    collectedAt: { type: Date },
   },
   { timestamps: true },
 );

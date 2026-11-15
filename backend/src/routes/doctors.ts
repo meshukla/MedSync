@@ -8,10 +8,69 @@ import { Prescription } from '../models/Prescription';
 import { User } from '../models/User';
 import { requireAuth, AuthenticatedRequest, requireRole } from '../middleware/auth';
 import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realtime/socket';
+import { recordAudit } from '../utils/audit';
 import { signPrescription } from '../utils/prescriptionSignature';
 import { successResponse } from '../utils/response';
 
 const router = Router();
+
+const startTimeSchema = z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/)
+  .refine((value) => Number(value.slice(-2)) % 10 === 0, 'Times must use 10-minute intervals.');
+const endTimeSchema = z.string().regex(/^(?:(?:[01]\d|2[0-3]):[0-5]\d|24:00)$/)
+  .refine((value) => Number(value.slice(-2)) % 10 === 0, 'Times must use 10-minute intervals.');
+const availabilitySchema = z.array(z.object({
+  dayOfWeek: z.number().int().min(0).max(6),
+  startTime: startTimeSchema,
+  endTime: endTimeSchema,
+})).length(7).superRefine((availability, context) => {
+  const days = new Set<number>();
+  availability.forEach((entry, index) => {
+    if (days.has(entry.dayOfWeek)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: [index, 'dayOfWeek'], message: 'Each weekday must appear once.' });
+    }
+    days.add(entry.dayOfWeek);
+    if (entry.endTime < entry.startTime) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: [index, 'endTime'], message: 'End time cannot be earlier than start time.' });
+    }
+  });
+});
+
+router.get('/availability', requireAuth, requireRole('doctor'), async (req: AuthenticatedRequest, res) => {
+  const doctor = await Doctor.findOne({ userId: req.user?.id }).select('weeklyAvailability');
+  if (!doctor) {
+    return res.status(404).json({ success: false, message: 'Doctor profile not found.' });
+  }
+  return res.json(successResponse('Doctor availability loaded.', doctor.weeklyAvailability));
+});
+
+router.put('/availability', requireAuth, requireRole('doctor'), async (req: AuthenticatedRequest, res) => {
+  const parsed = availabilitySchema.safeParse(req.body?.weeklyAvailability);
+  if (!parsed.success) {
+    return res.status(400).json({
+      success: false,
+      message: 'Provide one valid availability window for each weekday.',
+      details: parsed.error.flatten(),
+    });
+  }
+  const doctor = await Doctor.findOneAndUpdate(
+    { userId: req.user?.id },
+    { $set: { weeklyAvailability: parsed.data } },
+    { new: true, runValidators: true },
+  ).select('_id weeklyAvailability');
+  if (!doctor) {
+    return res.status(404).json({ success: false, message: 'Doctor profile not found.' });
+  }
+  await recordAudit(req, {
+    action: 'doctor.availability_updated',
+    entityType: 'doctor',
+    entityId: doctor.id,
+    details: { weeklyAvailability: doctor.weeklyAvailability },
+  });
+  publishAdminEvent('doctor.availability-updated', { doctorId: doctor.id });
+  publishRoleEvent('patient', 'doctor.availability-updated', { doctorId: doctor.id });
+  publishUserEvent(req.user?.id || '', 'doctor.availability-updated', { doctorId: doctor.id });
+  return res.json(successResponse('Doctor availability updated.', doctor.weeklyAvailability));
+});
 
 router.get('/appointments', requireAuth, requireRole('doctor'), async (req: AuthenticatedRequest, res) => {
   const doctor = await Doctor.findOne({ userId: req.user?.id }).select('_id');
@@ -78,10 +137,6 @@ router.post('/appointments/:id/prescription', requireAuth, requireRole('doctor')
   if (!patient || !doctorUser) {
     return res.status(404).json({ success: false, message: 'Patient or doctor account not found.' });
   }
-  if (!patient.deliveryAddress?.trim()) {
-    return res.status(409).json({ success: false, message: 'Ask the patient to save a delivery address before sending a prescription to the pharmacy.' });
-  }
-
   const signedAt = new Date();
   const prescriptionData = {
     appointmentId: appointment._id,

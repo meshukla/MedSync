@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { io } from 'socket.io-client'
+import { getTabSessionId } from './tabSession'
 
 type VideoRole = 'patient' | 'doctor'
 type VideoJoined = {
@@ -46,7 +47,10 @@ export default function VideoConsultation({ appointmentId, role, serverUrl, onCl
 
   useEffect(() => {
     let disposed = false
-    const socket = io(serverUrl, { withCredentials: true })
+    const socket = io(serverUrl, {
+      withCredentials: true,
+      auth: { tabSessionId: getTabSessionId() },
+    })
     socketConnection.current = socket
 
     const drainCandidates = async (connection: RTCPeerConnection) => {

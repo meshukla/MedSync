@@ -15,6 +15,11 @@ export type DoctorDocument = {
   department: string;
   fee: number;
   availability: Date[];
+  weeklyAvailability?: {
+    dayOfWeek: number;
+    startTime: string;
+    endTime: string;
+  }[];
 };
 
 export type InventoryDocument = {
@@ -22,6 +27,7 @@ export type InventoryDocument = {
   medicine: string;
   stock: number;
   lowStockThreshold: number;
+  deductedOrderIds: Types.ObjectId[];
 };
 
 const departmentSchema = new Schema<DepartmentDocument>({
@@ -37,12 +43,21 @@ const doctorSchema = new Schema<DoctorDocument>({
   department: { type: String, required: true },
   fee: { type: Number, required: true, min: 0 },
   availability: { type: [Date], default: [] },
+  weeklyAvailability: {
+    type: [{
+      dayOfWeek: { type: Number, required: true, min: 0, max: 6 },
+      startTime: { type: String, required: true },
+      endTime: { type: String, required: true },
+    }],
+    default: () => Array.from({ length: 7 }, (_, dayOfWeek) => ({ dayOfWeek, startTime: '00:00', endTime: '24:00' })),
+  },
 });
 
 const inventorySchema = new Schema<InventoryDocument>({
   medicine: { type: String, required: true, unique: true },
   stock: { type: Number, required: true, min: 0 },
   lowStockThreshold: { type: Number, required: true, min: 0, default: 10 },
+  deductedOrderIds: [{ type: Schema.Types.ObjectId, ref: 'PharmacyOrder', default: [] }],
 });
 
 export const Department = models.Department || model<DepartmentDocument>('Department', departmentSchema);

@@ -2,6 +2,8 @@ import { model, models, Schema, Types } from 'mongoose';
 
 export const paymentStatuses = ['CREATED', 'CAPTURED', 'FAILED'] as const;
 export type PaymentStatus = (typeof paymentStatuses)[number];
+export const refundStatuses = ['NOT_REQUESTED', 'PENDING', 'PROCESSED', 'FAILED'] as const;
+export type RefundStatus = (typeof refundStatuses)[number];
 
 export type PaymentDocument = {
   _id: Types.ObjectId;
@@ -15,6 +17,11 @@ export type PaymentDocument = {
   status: PaymentStatus;
   idempotencyKey: string;
   capturedAt?: Date;
+  refundId?: string;
+  refundAmountPaise?: number;
+  refundStatus: RefundStatus;
+  refundRequestedAt?: Date;
+  refundedAt?: Date;
 };
 
 const paymentSchema = new Schema<PaymentDocument>(
@@ -29,6 +36,11 @@ const paymentSchema = new Schema<PaymentDocument>(
     status: { type: String, enum: paymentStatuses, required: true, default: 'CREATED' },
     idempotencyKey: { type: String, required: true },
     capturedAt: { type: Date },
+    refundId: { type: String, unique: true, sparse: true },
+    refundAmountPaise: { type: Number, min: 1 },
+    refundStatus: { type: String, enum: refundStatuses, required: true, default: 'NOT_REQUESTED' },
+    refundRequestedAt: { type: Date },
+    refundedAt: { type: Date },
   },
   { timestamps: true },
 );

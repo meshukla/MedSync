@@ -5,6 +5,7 @@ import { env } from '../config/env';
 import { requireAuth, AuthenticatedRequest, requireRole } from '../middleware/auth';
 import { Appointment } from '../models/Appointment';
 import { Payment } from '../models/Payment';
+import { AuditLog } from '../models/AuditLog';
 import { PharmacyOrder } from '../models/PharmacyOrder';
 import { Doctor } from '../models/Clinic';
 import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realtime/socket';
@@ -328,12 +329,50 @@ router.post('/webhook', async (req, res) => {
 
   let event: {
     event?: string;
-    payload?: { payment?: { entity?: { id?: string; order_id?: string; amount?: number; currency?: string } } };
+    payload?: {
+      payment?: { entity?: { id?: string; order_id?: string; amount?: number; currency?: string } };
+      refund?: { entity?: { id?: string; payment_id?: string; amount?: number } };
+    };
   };
   try {
     event = JSON.parse(req.body.toString('utf8')) as typeof event;
   } catch {
     return res.status(400).json({ success: false, message: 'Invalid webhook payload.' });
+  }
+
+  const refundEntity = event.payload?.refund?.entity;
+  if ((event.event === 'refund.processed' || event.event === 'refund.failed') && refundEntity?.id) {
+    const payment = await Payment.findOne({
+      $or: [
+        { refundId: refundEntity.id },
+        ...(refundEntity.payment_id ? [{ providerPaymentId: refundEntity.payment_id }] : []),
+      ],
+    });
+    if (payment) {
+      const refundStatus = event.event === 'refund.processed' ? 'PROCESSED' : 'FAILED';
+      const updatedPayment = await Payment.findOneAndUpdate(
+        { _id: payment._id, refundStatus: { $ne: 'PROCESSED' } },
+        { $set: { refundId: refundEntity.id, refundStatus, ...(refundStatus === 'PROCESSED' ? { refundedAt: new Date() } : {}) } },
+        { new: true },
+      );
+      if (updatedPayment) {
+        const eventPayload = {
+          appointmentId: updatedPayment.appointmentId?.toString(),
+          refundStatus: updatedPayment.refundStatus,
+          amountPaise: refundEntity.amount || updatedPayment.refundAmountPaise,
+        };
+        publishUserEvent(updatedPayment.patientId.toString(), 'appointment.refund-status', eventPayload);
+        publishAdminEvent('appointment.refund-status', eventPayload);
+        await AuditLog.create({
+          actorRole: 'system',
+          action: `appointment.refund_${refundStatus.toLowerCase()}`,
+          entityType: 'payment',
+          entityId: updatedPayment.id,
+          details: eventPayload,
+        });
+      }
+    }
+    return res.json(successResponse('Refund webhook event acknowledged.'));
   }
 
   const paymentEntity = event.payload?.payment?.entity;

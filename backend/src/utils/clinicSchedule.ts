@@ -9,6 +9,18 @@ type ClinicDateParts = {
   second: number;
 };
 
+export type WeeklyAvailability = {
+  dayOfWeek: number;
+  startTime: string;
+  endTime: string;
+};
+
+const defaultWeeklyAvailability: WeeklyAvailability[] = Array.from({ length: 7 }, (_, dayOfWeek) => ({
+  dayOfWeek,
+  startTime: '00:00',
+  endTime: '24:00',
+}));
+
 const clinicFormatter = new Intl.DateTimeFormat('en-GB', {
   timeZone: env.clinicTimeZone,
   year: 'numeric',
@@ -88,14 +100,37 @@ export const clinicDateTimeToDate = (dateValue: string, timeValue: string): Date
   return result;
 };
 
-export const getClinicSlots = (dateValue: string, now = new Date()) => {
+export const getClinicSlots = (
+  dateValue: string,
+  now = new Date(),
+  weeklyAvailability: WeeklyAvailability[] = defaultWeeklyAvailability,
+) => {
   if (!isValidDateValue(dateValue) || dateValue < getClinicDate(now)) return [];
 
   const slots: { time: string; slot: Date }[] = [];
-  for (let minutes = 0; minutes < 24 * 60; minutes += 10) {
-    const time = `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
-    const slot = clinicDateTimeToDate(dateValue, time);
-    if (slot && slot > now) slots.push({ time, slot });
+  const [year, month, day] = dateValue.split('-').map(Number);
+  const dayOfWeek = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+  const availability = weeklyAvailability.filter((entry) => entry.dayOfWeek === dayOfWeek);
+  for (const entry of availability) {
+    const startMinutes = timeToMinutes(entry.startTime);
+    const endMinutes = timeToMinutes(entry.endTime);
+    if (startMinutes === null || endMinutes === null || endMinutes <= startMinutes) continue;
+    for (let minutes = startMinutes; minutes < endMinutes; minutes += 10) {
+      const time = `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
+      const slot = clinicDateTimeToDate(dateValue, time);
+      if (slot && slot > now) slots.push({ time, slot });
+    }
   }
-  return slots;
+  return slots.sort((left, right) => left.slot.getTime() - right.slot.getTime())
+    .filter((entry, index, entries) => index === 0 || entry.slot.getTime() !== entries[index - 1].slot.getTime());
+};
+
+const timeToMinutes = (value: string) => {
+  if (value === '24:00') return 24 * 60;
+  const match = /^(\d{2}):(\d{2})$/.exec(value);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours >= 24 || minutes >= 60 || minutes % 10 !== 0) return null;
+  return hours * 60 + minutes;
 };

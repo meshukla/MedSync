@@ -2,6 +2,8 @@ import { Router } from 'express';
 import { PharmacyOrder } from '../models/PharmacyOrder';
 import { requireAuth, AuthenticatedRequest, requireRole } from '../middleware/auth';
 import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realtime/socket';
+import { clearOrderInventoryDeductions } from '../services/inventory';
+import { recordAudit } from '../utils/audit';
 import { successResponse } from '../utils/response';
 
 const router = Router();
@@ -20,16 +22,24 @@ router.patch('/assignments/:id/complete', requireAuth, requireRole('deliveryBoy'
   const filter = req.user?.role === 'admin'
     ? { _id: req.params.id, status: 'OUT_FOR_DELIVERY' }
     : { _id: req.params.id, assignedDeliveryId: req.user?.id, status: 'OUT_FOR_DELIVERY' };
-  const order = await PharmacyOrder.findOneAndUpdate(filter, { $set: { status: 'DELIVERED' } }, { new: true });
-  if (!order) {
-    return res.status(404).json({ success: false, message: 'Active delivery assignment not found.' });
-  }
+  const delivered = await PharmacyOrder.findOneAndUpdate(
+    filter,
+    { $set: { status: 'DELIVERED', deliveredAt: new Date() } },
+    { new: true },
+  );
+  if (!delivered) return res.status(404).json({ success: false, message: 'Active delivery assignment not found.' });
 
-  const event = { pharmacyOrderId: order.id, patientId: order.patientId.toString(), status: order.status };
-  publishUserEvent(order.patientId.toString(), 'delivery.completed', event);
+  await clearOrderInventoryDeductions(delivered.id);
+  await recordAudit(req, { action: 'delivery.completed', entityType: 'pharmacyOrder', entityId: delivered.id });
+  const event = { pharmacyOrderId: delivered.id, patientId: delivered.patientId.toString(), status: delivered.status };
+  publishUserEvent(delivered.patientId.toString(), 'delivery.completed', event);
   publishRoleEvent('pharmacist', 'delivery.completed', event);
+  if (delivered.assignedDeliveryId) {
+    publishUserEvent(delivered.assignedDeliveryId.toString(), 'delivery.completed', event);
+  }
+  publishRoleEvent('deliveryBoy', 'delivery.completed', event);
   publishAdminEvent('delivery.completed', event);
-  return res.json(successResponse('Delivery marked complete.', order));
+  return res.json(successResponse('Delivery marked complete.', delivered));
 });
 
 export default router;

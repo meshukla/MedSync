@@ -14,6 +14,8 @@ export type AppointmentDocument = {
   status: AppointmentStatus;
   consultationType: 'OFFLINE' | 'ONLINE';
   videoConsultationCompletedAt?: Date;
+  rescheduledAt?: Date;
+  rescheduleCount: number;
   createdAt: Date;
 };
 
@@ -28,10 +30,19 @@ const appointmentSchema = new Schema<AppointmentDocument>(
     status: { type: String, enum: appointmentStatuses, default: 'PAYMENT_PENDING' },
     consultationType: { type: String, enum: ['OFFLINE', 'ONLINE'], default: 'OFFLINE' },
     videoConsultationCompletedAt: { type: Date },
+    rescheduledAt: { type: Date },
+    rescheduleCount: { type: Number, min: 0, default: 0 },
   },
   { timestamps: true },
 );
 
-appointmentSchema.index({ doctorId: 1, slot: 1 }, { unique: true });
+appointmentSchema.index(
+  { doctorId: 1, slot: 1 },
+  {
+    name: 'active_doctor_slot',
+    unique: true,
+    partialFilterExpression: { status: { $in: ['REQUESTED', 'PAYMENT_PENDING', 'CONFIRMED'] } },
+  },
+);
 
 export const Appointment = models.Appointment || model<AppointmentDocument>('Appointment', appointmentSchema);

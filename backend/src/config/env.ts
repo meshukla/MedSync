@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
+import { resolve } from 'node:path';
 
-dotenv.config();
+dotenv.config({ path: resolve(__dirname, '../../.env') });
 
 const turnUrls = (process.env.TURN_URLS || '').split(',').map((url) => url.trim()).filter(Boolean);
 const turnSharedSecret = process.env.TURN_SHARED_SECRET || '';
@@ -27,8 +28,8 @@ export const env = {
   turnSharedSecret,
   turnCredentialTtlSeconds: configuredTurnTtl,
   prescriptionSigningSecret: process.env.PRESCRIPTION_SIGNING_SECRET || process.env.JWT_ACCESS_SECRET || 'dev-access-secret',
-  brevoApiKey: process.env.BREVO_API_KEY || '',
-  brevoSenderEmail: process.env.BREVO_SENDER_EMAIL || '',
+  brevoApiKey: process.env.BREVO_API_KEY?.trim() || '',
+  brevoSenderEmail: process.env.BREVO_SENDER_EMAIL?.trim() || '',
   razorpayKeyId: process.env.RAZORPAY_KEY_ID || '',
   razorpayKeySecret: process.env.RAZORPAY_KEY_SECRET || '',
   razorpayWebhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET || '',

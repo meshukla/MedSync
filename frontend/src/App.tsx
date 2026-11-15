@@ -1,20 +1,38 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
+import { Navigate, Route, Routes, useNavigate } from 'react-router-dom'
 import { io } from 'socket.io-client'
+import { getTabSessionId } from './tabSession'
 import './App.css'
 import VideoConsultation from './VideoConsultation'
 
 type Role = 'patient' | 'doctor' | 'admin' | 'pharmacist' | 'deliveryBoy'
 type User = { id: string; name: string; email: string; phone?: string; deliveryAddress?: string; role: Role }
 type Doctor = { _id: string; name: string; specialization: string; department: string; fee: number }
+type DepartmentRecord = { _id: string; name: string; code: string; description: string }
+type AuditEntry = {
+  _id: string
+  action: string
+  entityType: string
+  entityId: string
+  actorRole: string
+  actorId?: { name?: string; role?: string }
+  createdAt: string
+  details: Record<string, unknown>
+}
+type WeeklyAvailability = { dayOfWeek: number; startTime: string; endTime: string }
 type Checkout = { keyId: string; orderId: string; amount: number; currency: string }
 type Appointment = {
   _id: string
+  doctorId?: string
   doctorName: string
   department: string
   slot: string
   fee: number
   status: string
+  refundStatus?: string
+  refundAmountPaise?: number
+  paymentStatus?: string
   consultationType?: 'OFFLINE' | 'ONLINE'
   videoConsultationCompletedAt?: string
   checkout?: Checkout
@@ -53,6 +71,8 @@ type DashboardData = {
   inventory?: InventoryItem[]
   deliveryStaff?: DeliveryStaff[]
   users?: ManagedUser[]
+  departments?: DepartmentRecord[]
+  auditLogs?: AuditEntry[]
   stats?: Record<string, number>
 }
 
@@ -127,10 +147,16 @@ class ApiError extends Error {
 
 function refreshSession(): Promise<boolean> {
   if (!refreshPromise) {
-    refreshPromise = fetch(apiUrl('auth/refresh'), {
+    const tabSessionId = getTabSessionId()
+    const request = () => fetch(apiUrl('auth/refresh'), {
       method: 'POST',
       credentials: 'include',
-    }).then((response) => response.ok).finally(() => {
+      headers: { 'X-MedSync-Tab-ID': tabSessionId },
+    }).then((response) => response.ok)
+    const requestWithCrossTabLock = navigator.locks
+      ? navigator.locks.request(`medsync-auth-refresh-${tabSessionId}`, request)
+      : request()
+    refreshPromise = requestWithCrossTabLock.finally(() => {
       refreshPromise = null
     })
   }
@@ -138,11 +164,25 @@ function refreshSession(): Promise<boolean> {
 }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const request = () => fetch(apiUrl(path), {
-      ...init,
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json', ...init.headers },
-    })
+  const request = async () => {
+    try {
+      const tabSessionId = getTabSessionId()
+      return await fetch(apiUrl(path), {
+        ...init,
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          ...init.headers,
+          'X-MedSync-Tab-ID': tabSessionId,
+        },
+      })
+    } catch (error) {
+      if (error instanceof TypeError) {
+        throw new Error(`Could not connect to the MedSync API at ${apiOrigin}. Check that the backend is running, VITE_API_BASE_URL is correct, and the backend allows this site in CLIENT_URL.`)
+      }
+      throw error
+    }
+  }
   let response = await request()
   const shouldRefresh = path === 'auth/me' || !path.startsWith('auth/')
   if (response.status === 401 && shouldRefresh && await refreshSession()) {
@@ -204,6 +244,14 @@ const roleTitles: Record<Role, string> = {
   deliveryBoy: 'Delivery',
 }
 
+const rolePaths: Record<Role, string> = {
+  patient: '/patient',
+  doctor: '/doctor',
+  admin: '/admin',
+  pharmacist: '/pharmacy',
+  deliveryBoy: '/delivery',
+}
+
 const loginRoles: { role: Role; label: string }[] = [
   { role: 'patient', label: 'Patient' },
   { role: 'doctor', label: 'Doctor' },
@@ -215,19 +263,23 @@ const loginRoles: { role: Role; label: string }[] = [
 const dashboardEndpoints: Record<Role, string[]> = {
   patient: ['patients/doctors', 'patients/appointments', 'patients/orders'],
   doctor: ['doctors/appointments'],
-  admin: ['admin/dashboard', 'admin/users'],
+  admin: ['admin/dashboard', 'admin/users', 'admin/audit-logs'],
   pharmacist: ['pharmacy/orders', 'pharmacy/inventory', 'pharmacy/delivery-staff'],
   deliveryBoy: ['delivery/assignments'],
 }
 
 function App() {
+  const navigate = useNavigate()
   const [user, setUser] = useState<User | null>(null)
   const [loading, setLoading] = useState(true)
   const [data, setData] = useState<DashboardData>({})
   const [message, setMessage] = useState('')
   const [videoAppointment, setVideoAppointment] = useState<Appointment | null>(null)
+  const [live, setLive] = useState(false)
+  const dashboardRequestId = useRef(0)
 
   const loadDashboard = useCallback(async (currentUser: User) => {
+    const requestId = ++dashboardRequestId.current
     const responses = await Promise.all(dashboardEndpoints[currentUser.role].map((path) => api<unknown>(path)))
     const next: DashboardData = {}
     if (currentUser.role === 'patient') {
@@ -237,9 +289,12 @@ function App() {
     } else if (currentUser.role === 'doctor') {
       next.appointments = responses[0] as Appointment[]
     } else if (currentUser.role === 'admin') {
-      const summary = responses[0] as { stats: Record<string, number> }
+      const summary = responses[0] as { stats: Record<string, number>; appointments?: Appointment[]; departments?: DepartmentRecord[] }
       next.stats = summary.stats
+      next.appointments = summary.appointments
+      next.departments = summary.departments
       next.users = responses[1] as ManagedUser[]
+      next.auditLogs = responses[2] as AuditEntry[]
     } else if (currentUser.role === 'pharmacist') {
       next.orders = responses[0] as Order[]
       next.inventory = responses[1] as InventoryItem[]
@@ -247,7 +302,7 @@ function App() {
     } else {
       next.assignments = responses[0] as Order[]
     }
-    setData(next)
+    if (requestId === dashboardRequestId.current) setData(next)
   }, [])
 
   useEffect(() => {
@@ -264,10 +319,42 @@ function App() {
     return () => { active = false }
   }, [loadDashboard])
 
+  const refresh = useCallback(async () => {
+    if (user) await loadDashboard(user)
+  }, [loadDashboard, user])
+
+  const reconcileSession = useCallback(async (actionPending = false) => {
+    try {
+      const currentUser = await api<User>('auth/me')
+      if (currentUser.id === user?.id && currentUser.role === user.role) return false
+      await loadDashboard(currentUser)
+      setUser(currentUser)
+      setMessage(actionPending
+        ? `This tab's session changed to ${roleTitles[currentUser.role]}. The action was not completed.`
+        : "This tab's session changed. The dashboard has been updated.")
+      navigate(rolePaths[currentUser.role], { replace: true })
+      return true
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        setUser(null)
+        setData({})
+        setLive(false)
+        setMessage('Your session ended. Sign in again.')
+        navigate('/login', { replace: true })
+        return true
+      }
+      throw error
+    }
+  }, [loadDashboard, navigate, user])
+
   useEffect(() => {
     if (!user) return
-    const socket = io(apiOrigin, { withCredentials: true })
+    const socket = io(apiOrigin, {
+      withCredentials: true,
+      auth: { tabSessionId: getTabSessionId() },
+    })
     socket.on('connect', () => {
+      setLive(true)
       void loadDashboard(user).catch((error: unknown) => {
         setMessage(error instanceof Error ? error.message : 'Could not refresh dashboard data.')
       })
@@ -277,38 +364,59 @@ function App() {
         setMessage(error instanceof Error ? error.message : 'Could not refresh live dashboard data.')
       })
     })
-    socket.on('connect_error', () => {
-      setMessage('Live updates are temporarily unavailable. Dashboard data can still be refreshed.')
+    socket.on('connect_error', (error) => {
+      setLive(false)
+      const errorMessage = error.message.toLowerCase()
+      if (errorMessage.includes('authentication') || errorMessage.includes('expired')) {
+        void api<User>('auth/me').then(async (currentUser) => {
+          if (currentUser.id !== user.id || currentUser.role !== user.role) {
+            await reconcileSession()
+            return
+          }
+          socket.connect()
+        }).catch((sessionError: unknown) => {
+          if (sessionError instanceof ApiError && sessionError.status === 401) {
+            setUser(null)
+            setData({})
+            setMessage('Your session ended. Sign in again.')
+            navigate('/login', { replace: true })
+            return
+          }
+          setMessage(sessionError instanceof Error
+            ? sessionError.message
+            : 'Live updates are temporarily unavailable. Dashboard data can still be refreshed.')
+        })
+      } else {
+        setMessage('Live updates are temporarily unavailable. Dashboard data can still be refreshed.')
+      }
+    })
+    socket.on('disconnect', (reason) => {
+      setLive(false)
+      if (reason === 'io server disconnect') {
+        void reconcileSession().catch((error: unknown) => {
+          setMessage(error instanceof Error ? error.message : 'Could not verify the current browser session.')
+        })
+      }
     })
     return () => { socket.disconnect() }
-  }, [loadDashboard, user])
+  }, [loadDashboard, navigate, reconcileSession, user])
 
-  const refresh = useCallback(async () => {
-    if (user) await loadDashboard(user)
-  }, [loadDashboard, user])
-
-  const reconcileSession = async () => {
-    try {
-      const currentUser = await api<User>('auth/me')
-      if (currentUser.id === user?.id && currentUser.role === user.role) return false
-      await loadDashboard(currentUser)
-      setUser(currentUser)
-      setMessage(`This tab's shared session changed to ${roleTitles[currentUser.role]} in another tab. The action was not completed.`)
-      return true
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
-        setUser(null)
-        setData({})
-        setMessage('Your session ended. Sign in again.')
-        return true
-      }
-      throw error
+  useEffect(() => {
+    const handleFocus = () => {
+      void reconcileSession().catch((error: unknown) => {
+        setMessage(error instanceof Error ? error.message : 'Could not verify this tab’s session.')
+      })
     }
-  }
+    window.addEventListener('focus', handleFocus)
+    return () => {
+      window.removeEventListener('focus', handleFocus)
+    }
+  }, [reconcileSession])
 
   const perform = async (action: () => Promise<void>) => {
     setMessage('')
     try {
+      if (user && await reconcileSession(true)) return
       await action()
       await refresh()
     } catch (error) {
@@ -330,18 +438,25 @@ function App() {
       setUser(null)
       setData({})
       setMessage('')
+      setLive(false)
+      navigate('/login', { replace: true })
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Could not sign out.')
     }
   }
 
   if (loading) return <div className="loading-screen">Connecting to MedSync...</div>
-  if (!user) return <AuthScreen message={message} setMessage={setMessage} onLogin={async (profile) => {
-    await loadDashboard(profile)
-    setUser(profile)
-  }} />
+  if (!user) return <Routes>
+    <Route path="/login" element={<AuthScreen message={message} setMessage={setMessage} onLogin={async (profile) => {
+      await loadDashboard(profile)
+      setUser(profile)
+      setMessage('')
+      navigate(rolePaths[profile.role], { replace: true })
+    }} />} />
+    <Route path="*" element={<Navigate to="/login" replace />} />
+  </Routes>
 
-  return (
+  const dashboard = (
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand-block">
@@ -359,7 +474,10 @@ function App() {
       <main className="main-panel">
         <header className="topbar">
           <div><p className="eyebrow">{roleTitles[user.role]} workspace</p><h1>Welcome, {user.name.split(' ')[0]}</h1></div>
-          <button type="button" className="secondary-btn" onClick={() => void signOut()}>Sign out</button>
+          <div className="topbar-actions">
+            <span className={`live-status${live ? ' connected' : ''}`} role="status">{live ? 'Live updates on' : 'Reconnecting...'}</span>
+            <button type="button" className="secondary-btn" onClick={() => void signOut()}>Sign out this tab</button>
+          </div>
         </header>
         {message && <div className="notice" role="alert">{message}</div>}
         <RoleDashboard user={user} data={data} perform={perform} setMessage={setMessage} onJoinVideo={setVideoAppointment} onForbiddenSession={reconcileSession} />
@@ -372,6 +490,15 @@ function App() {
       </main>
     </div>
   )
+
+  return <Routes>
+    <Route path="/patient" element={user.role === 'patient' ? dashboard : <Navigate to={rolePaths[user.role]} replace />} />
+    <Route path="/doctor" element={user.role === 'doctor' ? dashboard : <Navigate to={rolePaths[user.role]} replace />} />
+    <Route path="/admin" element={user.role === 'admin' ? dashboard : <Navigate to={rolePaths[user.role]} replace />} />
+    <Route path="/pharmacy" element={user.role === 'pharmacist' ? dashboard : <Navigate to={rolePaths[user.role]} replace />} />
+    <Route path="/delivery" element={user.role === 'deliveryBoy' ? dashboard : <Navigate to={rolePaths[user.role]} replace />} />
+    <Route path="*" element={<Navigate to={rolePaths[user.role]} replace />} />
+  </Routes>
 }
 
 function AuthScreen({ message, setMessage, onLogin }: {
@@ -569,6 +696,10 @@ function PatientDashboard({ user, data, perform, setMessage, onJoinVideo }: {
   const [doctorId, setDoctorId] = useState('')
   const [appointmentDate, setAppointmentDate] = useState(() => clinicDateValue(new Date()))
   const [appointmentTime, setAppointmentTime] = useState('')
+  const [reschedulingId, setReschedulingId] = useState('')
+  const [rescheduleDate, setRescheduleDate] = useState('')
+  const [rescheduleTime, setRescheduleTime] = useState('')
+  const [rescheduleSlotData, setRescheduleSlotData] = useState<{ key: string; times: string[] } | null>(null)
   const [slotData, setSlotData] = useState<{ key: string; status: 'loaded' | 'error'; times: string[] }>({
     key: '',
     status: 'loaded',
@@ -583,6 +714,9 @@ function PatientDashboard({ user, data, perform, setMessage, onJoinVideo }: {
   const currentSlotData = slotData.key === slotKey ? slotData : null
   const availableTimes = currentSlotData?.status === 'loaded' ? currentSlotData.times : []
   const loadingTimes = Boolean(slotKey) && currentSlotData === null
+  const activeRescheduleSlotKey = `${reschedulingId}:${rescheduleDate}`
+  const rescheduleTimes = rescheduleSlotData?.key === activeRescheduleSlotKey ? rescheduleSlotData.times : []
+  const rescheduleLoading = Boolean(reschedulingId && rescheduleDate && rescheduleSlotData?.key !== activeRescheduleSlotKey)
 
   useEffect(() => {
     let active = true
@@ -602,7 +736,27 @@ function PatientDashboard({ user, data, perform, setMessage, onJoinVideo }: {
         }
       })
     return () => { active = false }
-  }, [appointmentDate, doctorId, setMessage, slotRefresh])
+  }, [appointmentDate, data.doctors, doctorId, setMessage, slotRefresh])
+
+  useEffect(() => {
+    let active = true
+    const appointment = (data.appointments || []).find((item) => item._id === reschedulingId)
+    if (!appointment?.doctorId || !rescheduleDate) {
+      return () => { active = false }
+    }
+    const key = `${reschedulingId}:${rescheduleDate}`
+    void api<string[]>(`patients/doctors/${appointment.doctorId}/slots?date=${encodeURIComponent(rescheduleDate)}`)
+      .then((times) => {
+        if (active) setRescheduleSlotData({ key, times })
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          setRescheduleSlotData({ key, times: [] })
+          setMessage(error instanceof Error ? error.message : 'Could not load appointment times.')
+        }
+      })
+    return () => { active = false }
+  }, [data.appointments, rescheduleDate, reschedulingId, setMessage])
 
   const bookAppointment = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -691,15 +845,43 @@ function PatientDashboard({ user, data, perform, setMessage, onJoinVideo }: {
       <section className="dashboard-panel">
         <h3>Your appointments</h3>
         <div className="record-list">
-          {(data.appointments || []).map((appointment) => <article className="record" key={appointment._id}>
-            <div><strong>{appointment.doctorName}</strong><span>{appointment.department} · {formatClinicDateTime(appointment.slot)}</span></div>
-            <span className={`status ${appointment.status.toLowerCase()}`}>{appointment.status.replaceAll('_', ' ')}</span>
-            {appointment.consultationType === 'ONLINE' && appointment.status === 'CONFIRMED' && !appointment.videoConsultationCompletedAt && <button className="small-btn" onClick={() => onJoinVideo(appointment)}>Join video consultation</button>}
-            {appointment.consultationType === 'ONLINE' && appointment.videoConsultationCompletedAt && <span>Video consultation completed</span>}
-            {appointment.status === 'PAYMENT_PENDING' && appointment.checkout && <button className="small-btn" onClick={() => payForAppointment(appointment)}>Pay ₹{appointment.fee.toLocaleString()}</button>}
-            {(appointment.status === 'PAYMENT_PENDING' || appointment.status === 'REQUESTED') && <button className="small-btn" onClick={() => void perform(async () => {
-              await api(`patients/appointments/${appointment._id}/cancel`, { method: 'PATCH' })
-            })}>Cancel</button>}
+          {(data.appointments || []).map((appointment) => <article className="record appointment-record" key={appointment._id}>
+            <div className="appointment-summary"><strong>{appointment.doctorName}</strong><span>{appointment.department} · {formatClinicDateTime(appointment.slot)}</span></div>
+            <div className="appointment-actions">
+              <span className={`status ${appointment.status.toLowerCase()}`}>{appointment.status.replaceAll('_', ' ')}</span>
+              {appointment.refundStatus && appointment.refundStatus !== 'NOT_REQUESTED' && <span className="appointment-refund">Refund: {appointment.refundStatus.replaceAll('_', ' ')}</span>}
+              {appointment.consultationType === 'ONLINE' && appointment.status === 'CONFIRMED' && !appointment.videoConsultationCompletedAt && <button className="small-btn" onClick={() => onJoinVideo(appointment)}>Join video consultation</button>}
+              {appointment.consultationType === 'ONLINE' && appointment.videoConsultationCompletedAt && <span className="appointment-refund">Video consultation completed</span>}
+              {appointment.status === 'PAYMENT_PENDING' && appointment.checkout && <button className="small-btn" onClick={() => payForAppointment(appointment)}>Pay ₹{appointment.fee.toLocaleString()}</button>}
+              {['PAYMENT_PENDING', 'REQUESTED', 'CONFIRMED'].includes(appointment.status) && <button className="small-btn" onClick={() => {
+                const date = clinicDateValue(new Date(appointment.slot))
+                setRescheduleDate(date < minimumDate ? minimumDate : date)
+                setRescheduleTime('')
+                setReschedulingId(reschedulingId === appointment._id ? '' : appointment._id)
+              }}>{reschedulingId === appointment._id ? 'Close rescheduling' : 'Reschedule'}</button>}
+              {['PAYMENT_PENDING', 'REQUESTED', 'CONFIRMED'].includes(appointment.status) && <button className="small-btn" onClick={() => void perform(async () => {
+                await api(`patients/appointments/${appointment._id}/cancel`, { method: 'PATCH' })
+              })}>Cancel</button>}
+            </div>
+            {reschedulingId === appointment._id && <div className="form-stack appointment-reschedule">
+              <label className="field">New appointment date<input type="date" min={minimumDate} value={rescheduleDate} onChange={(event) => {
+                setRescheduleDate(event.target.value)
+                setRescheduleTime('')
+              }} /></label>
+              <label className="field">Available time<select value={rescheduleTime} onChange={(event) => setRescheduleTime(event.target.value)} disabled={rescheduleLoading}>
+                <option value="">{rescheduleLoading ? 'Loading times...' : rescheduleTimes.length ? 'Select a time' : 'No available times'}</option>
+                {rescheduleTimes.map((time) => <option key={time} value={time}>{formatTimeLabel(time)}</option>)}
+              </select></label>
+              <button className="small-btn" disabled={!rescheduleTime || rescheduleLoading} onClick={() => void perform(async () => {
+                await api(`patients/appointments/${appointment._id}/reschedule`, {
+                  method: 'PATCH',
+                  body: JSON.stringify({ date: rescheduleDate, time: rescheduleTime }),
+                })
+                setReschedulingId('')
+                setRescheduleTime('')
+                setSlotRefresh((refreshCount) => refreshCount + 1)
+              })}>Confirm new time</button>
+            </div>}
           </article>)}
           {(data.appointments || []).length === 0 && <p className="empty-state">No appointments yet.</p>}
         </div>
@@ -744,6 +926,7 @@ function DoctorDashboard({ user, data, perform, onJoinVideo, onForbiddenSession 
   const [prescriptionAppointment, setPrescriptionAppointment] = useState<Appointment | null>(null)
   return <>
     <section className="section-heading"><div><p className="eyebrow">CLINICAL WORKSPACE</p><h2>Appointments</h2></div><Metric value={String(appointments.length)} label="Total appointments" /></section>
+    <DoctorAvailabilityEditor perform={perform} />
     <section className="dashboard-panel">
       <AppointmentList appointments={appointments} perform={perform} onJoinVideo={onJoinVideo} onWritePrescription={setPrescriptionAppointment} />
     </section>
@@ -754,6 +937,71 @@ function DoctorDashboard({ user, data, perform, onJoinVideo, onForbiddenSession 
       onForbiddenSession={onForbiddenSession}
     />}
   </>
+}
+
+const weekdayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+
+function DoctorAvailabilityEditor({ perform }: { perform: (action: () => Promise<void>) => Promise<void> }) {
+  const [availability, setAvailability] = useState<WeeklyAvailability[]>(
+    weekdayNames.map((_, dayOfWeek) => ({ dayOfWeek, startTime: '00:00', endTime: '24:00' })),
+  )
+  const [loaded, setLoaded] = useState(false)
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    void api<WeeklyAvailability[]>('doctors/availability')
+      .then((schedule) => {
+        if (active) {
+          setAvailability(schedule)
+          setLoaded(true)
+        }
+      })
+      .catch(() => {
+        if (active) setLoaded(true)
+      })
+    return () => { active = false }
+  }, [])
+
+  const updateDay = (dayOfWeek: number, patch: Partial<WeeklyAvailability>) => {
+    setAvailability((current) => current.map((entry) => entry.dayOfWeek === dayOfWeek
+      ? { ...entry, ...patch }
+      : entry))
+    setSaved(false)
+  }
+
+  return <section className="dashboard-panel">
+    <h3>Weekly availability</h3>
+    {!loaded ? <p className="hint">Loading your schedule...</p> : <div className="record-list">
+      {weekdayNames.map((day, dayOfWeek) => {
+        const entry = availability.find((item) => item.dayOfWeek === dayOfWeek)
+          || { dayOfWeek, startTime: '00:00', endTime: '00:00' }
+        const available = entry.endTime !== entry.startTime
+        const allDay = entry.startTime === '00:00' && entry.endTime === '24:00'
+        return <div className="record" key={day}>
+          <strong>{day}</strong>
+          <label className="signature-confirm"><input type="checkbox" checked={available} onChange={(event) => updateDay(dayOfWeek, event.target.checked
+            ? { startTime: '09:00', endTime: '18:00' }
+            : { startTime: '00:00', endTime: '00:00' })} /> Available</label>
+          {available && <>
+            <label className="signature-confirm"><input type="checkbox" checked={allDay} onChange={(event) => updateDay(dayOfWeek, event.target.checked
+              ? { startTime: '00:00', endTime: '24:00' }
+              : { startTime: '09:00', endTime: '18:00' })} /> 24 hours</label>
+            {!allDay && <>
+              <label className="field">From<input type="time" step={600} value={entry.startTime} onChange={(event) => updateDay(dayOfWeek, { startTime: event.target.value })} /></label>
+              <label className="field">Until<input type="time" step={600} value={entry.endTime} onChange={(event) => updateDay(dayOfWeek, { endTime: event.target.value })} /></label>
+            </>}
+          </>}
+        </div>
+      })}
+    </div>}
+    {saved && <p className="success-text">Availability saved.</p>}
+    <button className="primary-btn" disabled={!loaded} onClick={() => void perform(async () => {
+      await api('doctors/availability', { method: 'PUT', body: JSON.stringify({ weeklyAvailability: availability }) })
+      setSaved(true)
+    })}>Save availability</button>
+    <p className="hint">Appointments use 10-minute start-time intervals within each available window.</p>
+  </section>
 }
 
 function AppointmentList({ appointments, perform, onJoinVideo, onWritePrescription }: {
@@ -885,6 +1133,7 @@ function PrescriptionForm({ appointment, doctorName, onClose, onForbiddenSession
 function AdminDashboard({ data, perform }: { data: DashboardData; perform: (action: () => Promise<void>) => Promise<void> }) {
   const [role, setRole] = useState<Role>('doctor')
   const [message, setMessage] = useState('')
+  const [departmentEdits, setDepartmentEdits] = useState<Record<string, Partial<DepartmentRecord>>>({})
   const createStaff = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const formElement = event.currentTarget
@@ -903,6 +1152,23 @@ function AdminDashboard({ data, perform }: { data: DashboardData; perform: (acti
       await api('admin/users', { method: 'POST', body: JSON.stringify({ ...payload, ...(role === 'doctor' ? { fee: Number(payload.fee) } : {}) }) })
       formElement.reset()
       setMessage('Staff account created.')
+    })
+  }
+
+  const createDepartment = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const formElement = event.currentTarget
+    const fields = new FormData(formElement)
+    void perform(async () => {
+      await api('admin/departments', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: String(fields.get('name') || ''),
+          code: String(fields.get('code') || ''),
+          description: String(fields.get('description') || ''),
+        }),
+      })
+      formElement.reset()
     })
   }
 
@@ -940,6 +1206,74 @@ function AdminDashboard({ data, perform }: { data: DashboardData; perform: (acti
           })}>{account.isActive ? 'Disable' : 'Enable'}</button>
         </article>)}</div>
       </div>
+    </section>
+    <section className="content-grid">
+      <div className="dashboard-panel">
+        <h3>Departments</h3>
+        <form className="form-stack" onSubmit={createDepartment}>
+          <Field label="Department name" name="name" required />
+          <Field label="Department code" name="code" required />
+          <label className="field">Description<textarea name="description" minLength={2} maxLength={500} required /></label>
+          <button className="primary-btn" type="submit">Add department</button>
+        </form>
+        <div className="record-list">{(data.departments || []).map((department) => {
+          const edit = departmentEdits[department._id] || {}
+          const value = { ...department, ...edit }
+          return <article className="record" key={department._id}>
+            <label className="field">Name<input value={value.name || ''} onChange={(event) => setDepartmentEdits((current) => ({
+              ...current,
+              [department._id]: { ...current[department._id], name: event.target.value },
+            }))} /></label>
+            <label className="field">Code<input value={value.code || ''} onChange={(event) => setDepartmentEdits((current) => ({
+              ...current,
+              [department._id]: { ...current[department._id], code: event.target.value },
+            }))} /></label>
+            <label className="field">Description<textarea value={value.description || ''} onChange={(event) => setDepartmentEdits((current) => ({
+              ...current,
+              [department._id]: { ...current[department._id], description: event.target.value },
+            }))} /></label>
+            <button className="small-btn" disabled={!Object.keys(edit).length} onClick={() => void perform(async () => {
+              await api(`admin/departments/${department._id}`, { method: 'PATCH', body: JSON.stringify(edit) })
+              setDepartmentEdits((current) => {
+                const next = { ...current }
+                delete next[department._id]
+                return next
+              })
+            })}>Save changes</button>
+            <button className="small-btn" onClick={() => void perform(async () => {
+              await api(`admin/departments/${department._id}`, { method: 'DELETE' })
+            })}>Delete</button>
+          </article>
+        })}</div>
+      </div>
+      <div className="dashboard-panel">
+        <h3>Appointment refunds</h3>
+        <div className="record-list">{(data.appointments || []).map((appointment) => <article className="record" key={appointment._id}>
+          <div><strong>{appointment.doctorName}</strong><span>{formatClinicDateTime(appointment.slot)} · {appointment.status.replaceAll('_', ' ')}</span></div>
+          <span>{appointment.refundStatus ? `Refund: ${appointment.refundStatus.replaceAll('_', ' ')}` : appointment.paymentStatus || 'Payment not captured'}</span>
+          {appointment.paymentStatus === 'CAPTURED'
+            && !['PENDING', 'PROCESSED'].includes(appointment.refundStatus || '')
+            && ['CONFIRMED', 'CANCELLED'].includes(appointment.status)
+            && <button className="small-btn" onClick={() => {
+              const reason = window.prompt('Reason for this refund exception')
+              if (!reason?.trim()) return
+              void perform(async () => {
+                await api(`admin/appointments/${appointment._id}/refund`, {
+                  method: 'POST',
+                  body: JSON.stringify({ reason: reason.trim() }),
+                })
+              })
+            }}>Request full refund</button>}
+        </article>)}</div>
+      </div>
+    </section>
+    <section className="dashboard-panel">
+      <h3>Recent audit log</h3>
+      <div className="record-list">{(data.auditLogs || []).map((entry) => <article className="record" key={entry._id}>
+        <div><strong>{entry.action.replaceAll('.', ' ')}</strong><span>{entry.actorId?.name || entry.actorRole} · {entry.entityType} {entry.entityId}</span></div>
+        <time dateTime={entry.createdAt}>{new Date(entry.createdAt).toLocaleString()}</time>
+      </article>)}</div>
+      {!(data.auditLogs || []).length && <p className="empty-state">No audit entries recorded yet.</p>}
     </section>
   </>
 }
@@ -1022,6 +1356,9 @@ function PharmacistDashboard({ data, perform }: { data: DashboardData; perform: 
           {next[order.status] && <button className="small-btn" onClick={() => void perform(async () => {
             await api(`pharmacy/orders/${order._id}/status`, { method: 'PATCH', body: JSON.stringify({ status: next[order.status] }) })
           })}>{next[order.status].replaceAll('_', ' ')}</button>}
+          {order.status === 'READY_FOR_PICKUP' && <button className="small-btn" onClick={() => void perform(async () => {
+            await api(`pharmacy/orders/${order._id}/collect`, { method: 'POST' })
+          })}>Mark collected</button>}
           {order.status === 'READY_FOR_DISPATCH' && <div className="assign-controls">
             <select aria-label="Assign delivery staff" value={deliveryIds[order._id] || ''} onChange={(event) => setDeliveryIds({ ...deliveryIds, [order._id]: event.target.value })}>
               <option value="">Select delivery staff</option>

@@ -8,8 +8,10 @@ import { User } from '../models/User';
 import { requireAuth, AuthenticatedRequest, requireRole } from '../middleware/auth';
 import { env } from '../config/env';
 import { getRazorpayClient, PaymentConfigurationError } from '../services/razorpay';
-import { publishAdminEvent, publishUserEvent } from '../realtime/socket';
+import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realtime/socket';
 import { successResponse } from '../utils/response';
+import { recordAudit } from '../utils/audit';
+import { requestFullRefund } from '../services/refunds';
 import { clinicDateTimeToDate, getClinicDate, getClinicSlots, isValidClinicDate } from '../utils/clinicSchedule';
 
 const router = Router();
@@ -36,13 +38,18 @@ router.get('/doctors/:doctorId/slots', requireAuth, requireRole('patient'), asyn
   if (date.data < getClinicDate(new Date())) {
     return res.status(400).json({ success: false, message: 'Appointment dates must be today or later.' });
   }
-  if (!await Doctor.exists({ _id: doctorId.data })) {
+  const doctor = await Doctor.findById(doctorId.data).select('weeklyAvailability');
+  if (!doctor) {
     return res.status(404).json({ success: false, message: 'Doctor not found.' });
   }
 
-  const slots = getClinicSlots(date.data);
+  const slots = getClinicSlots(date.data, new Date(), doctor.weeklyAvailability || []);
   const appointments = slots.length
-    ? await Appointment.find({ doctorId: doctorId.data, slot: { $in: slots.map(({ slot }) => slot) } })
+    ? await Appointment.find({
+      doctorId: doctorId.data,
+      status: { $in: ['REQUESTED', 'PAYMENT_PENDING', 'CONFIRMED'] },
+      slot: { $in: slots.map(({ slot }) => slot) },
+    })
       .select('slot')
       .lean()
     : [];
@@ -66,6 +73,8 @@ router.get('/appointments', requireAuth, requireRole('patient'), async (req: Aut
     const payment = latestPayment.get(appointment._id.toString());
     return {
       ...appointment,
+      refundStatus: payment?.refundStatus,
+      refundAmountPaise: payment?.refundAmountPaise,
       checkout: payment && appointment.status === 'PAYMENT_PENDING'
         ? { keyId: env.razorpayKeyId, orderId: payment.providerOrderId, amount: payment.amountPaise, currency: payment.currency }
         : undefined,
@@ -97,6 +106,9 @@ router.post('/appointments', requireAuth, requireRole('patient'), async (req: Au
 
   const existingPayment = await Payment.findOne({ patientId: req.user?.id, idempotencyKey });
   if (existingPayment) {
+    if (!existingPayment.appointmentId) {
+      return res.status(409).json({ success: false, message: 'The previous booking request could not be recovered.' });
+    }
     const existingAppointment = await Appointment.findOne({ _id: existingPayment.appointmentId, patientId: req.user?.id });
     if (!existingAppointment) {
       return res.status(409).json({ success: false, message: 'The previous booking request could not be recovered.' });
@@ -121,7 +133,11 @@ router.post('/appointments', requireAuth, requireRole('patient'), async (req: Au
     return res.status(404).json({ success: false, message: 'Doctor not found.' });
   }
 
-  if (await Appointment.exists({ doctorId: doctor.id, slot })) {
+  if (await Appointment.exists({
+    doctorId: doctor.id,
+    slot,
+    status: { $in: ['REQUESTED', 'PAYMENT_PENDING', 'CONFIRMED'] },
+  })) {
     return res.status(409).json({ success: false, message: 'That appointment slot is no longer available.' });
   }
 
@@ -184,25 +200,134 @@ router.post('/appointments', requireAuth, requireRole('patient'), async (req: Au
   }
 });
 
-router.patch('/appointments/:id/cancel', requireAuth, requireRole('patient'), async (req: AuthenticatedRequest, res) => {
-  const capturedPayment = await Payment.exists({ appointmentId: req.params.id, patientId: req.user?.id, status: 'CAPTURED' });
-  if (capturedPayment) {
-    return res.status(409).json({ success: false, message: 'Paid appointments must be cancelled through the hospital.' });
+const rescheduleSchema = z.object({
+  date: z.string(),
+  time: z.string(),
+});
+
+router.patch('/appointments/:id/reschedule', requireAuth, requireRole('patient'), async (req: AuthenticatedRequest, res) => {
+  const appointmentId = z.string().regex(/^[a-f\d]{24}$/i).safeParse(req.params.id);
+  const parsed = rescheduleSchema.safeParse(req.body);
+  if (!appointmentId.success || !parsed.success || !isValidClinicDate(parsed.data.date)) {
+    return res.status(400).json({ success: false, message: 'Choose a valid appointment date and time.' });
   }
-  const appointment = await Appointment.findOneAndUpdate(
-    { _id: req.params.id, patientId: req.user?.id, status: { $in: ['PAYMENT_PENDING', 'REQUESTED'] } },
+
+  const appointment = await Appointment.findOne({
+    _id: appointmentId.data,
+    patientId: req.user?.id,
+    status: { $in: ['REQUESTED', 'PAYMENT_PENDING', 'CONFIRMED'] },
+  });
+  if (!appointment) {
+    return res.status(404).json({ success: false, message: 'Active appointment not found.' });
+  }
+  const nextSlot = clinicDateTimeToDate(parsed.data.date, parsed.data.time);
+  if (!nextSlot || nextSlot <= new Date() || nextSlot.getTime() === appointment.slot.getTime()) {
+    return res.status(400).json({ success: false, message: 'Choose a different future appointment time.' });
+  }
+
+  const doctor = await Doctor.findById(appointment.doctorId).select('userId weeklyAvailability');
+  if (!doctor) {
+    return res.status(404).json({ success: false, message: 'Doctor not found.' });
+  }
+  const availableSlots = getClinicSlots(parsed.data.date, new Date(), doctor.weeklyAvailability || []);
+  if (!availableSlots.some(({ slot }) => slot.getTime() === nextSlot.getTime())) {
+    return res.status(400).json({ success: false, message: "That time is outside the doctor's available schedule." });
+  }
+
+  let updatedAppointment;
+  try {
+    updatedAppointment = await Appointment.findOneAndUpdate(
+      { _id: appointment._id, patientId: req.user?.id, status: appointment.status, slot: appointment.slot },
+      { $set: { slot: nextSlot, rescheduledAt: new Date() }, $inc: { rescheduleCount: 1 } },
+      { new: true },
+    );
+  } catch (error) {
+    if (isDuplicateKeyError(error)) {
+      return res.status(409).json({ success: false, message: 'That appointment slot is no longer available.' });
+    }
+    throw error;
+  }
+  if (!updatedAppointment) {
+    return res.status(409).json({ success: false, message: 'The appointment changed. Refresh and try again.' });
+  }
+
+  const event = {
+    appointmentId: updatedAppointment.id,
+    status: updatedAppointment.status,
+    previousSlot: appointment.slot.toISOString(),
+    slot: updatedAppointment.slot.toISOString(),
+  };
+  await recordAudit(req, {
+    action: 'appointment.rescheduled',
+    entityType: 'appointment',
+    entityId: updatedAppointment.id,
+    details: event,
+  });
+  publishUserEvent(req.user?.id || '', 'appointment.rescheduled', event);
+  publishUserEvent(doctor.userId.toString(), 'appointment.rescheduled', event);
+  publishAdminEvent('appointment.rescheduled', event);
+  return res.json(successResponse('Appointment rescheduled.', updatedAppointment));
+});
+
+router.patch('/appointments/:id/cancel', requireAuth, requireRole('patient'), async (req: AuthenticatedRequest, res) => {
+  const appointment = await Appointment.findOne({
+    _id: req.params.id,
+    patientId: req.user?.id,
+    status: { $in: ['PAYMENT_PENDING', 'REQUESTED', 'CONFIRMED'] },
+  });
+  if (!appointment) {
+    return res.status(404).json({ success: false, message: 'Active appointment not found.' });
+  }
+
+  const payment = await Payment.findOne({
+    appointmentId: appointment._id,
+    patientId: req.user?.id,
+    status: 'CAPTURED',
+  });
+  if (payment) {
+    if (appointment.slot.getTime() - Date.now() < 24 * 60 * 60_000) {
+      return res.status(409).json({
+        success: false,
+        message: 'Paid appointments can be cancelled for a full refund at least 24 hours in advance. Contact the hospital for an exception.',
+      });
+    }
+    const refundResult = await requestFullRefund(payment, 'patient_cancellation_at_least_24_hours_before');
+    if (!refundResult.success) {
+      return res.status(409).json({ success: false, message: refundResult.message });
+    }
+    await recordAudit(req, {
+      action: 'appointment.refund_requested',
+      entityType: 'payment',
+      entityId: payment.id,
+      details: { appointmentId: appointment.id, amountPaise: payment.amountPaise, refundId: refundResult.payment.refundId },
+    });
+  }
+
+  const cancelledAppointment = await Appointment.findOneAndUpdate(
+    { _id: appointment._id, patientId: req.user?.id, status: appointment.status },
     { $set: { status: 'CANCELLED' } },
     { new: true },
   );
-  if (!appointment) {
-    return res.status(404).json({ success: false, message: 'Requested appointment not found.' });
+  if (!cancelledAppointment) {
+    return res.status(409).json({ success: false, message: 'The appointment changed. Refresh and try again.' });
   }
-
   const doctor = await Doctor.findById(appointment.doctorId).select('userId');
-  const appointmentEvent = { appointmentId: appointment.id, status: appointment.status };
+  const appointmentEvent = {
+    appointmentId: appointment.id,
+    status: cancelledAppointment.status,
+    refundStatus: payment?.refundStatus === 'NOT_REQUESTED' ? 'PENDING' : payment?.refundStatus,
+  };
+  await recordAudit(req, {
+    action: 'appointment.cancelled',
+    entityType: 'appointment',
+    entityId: appointment.id,
+    details: { refundStatus: payment ? 'PENDING' : 'NOT_APPLICABLE' },
+  });
+  if (payment) publishUserEvent(req.user?.id || '', 'appointment.refund-status', appointmentEvent);
+  publishUserEvent(req.user?.id || '', 'appointment.cancelled', appointmentEvent);
   if (doctor) publishUserEvent(doctor.userId.toString(), 'appointment.cancelled', appointmentEvent);
   publishAdminEvent('appointment.cancelled', appointmentEvent);
-  return res.json(successResponse('Appointment cancelled.', appointment));
+  return res.json(successResponse('Appointment cancelled.', cancelledAppointment));
 });
 
 const addressSchema = z.object({
@@ -223,6 +348,10 @@ router.patch('/profile/address', requireAuth, requireRole('patient'), async (req
   if (!user) {
     return res.status(404).json({ success: false, message: 'Patient account not found.' });
   }
+  const event = { patientId: user.id };
+  publishUserEvent(user.id, 'patient.address-updated', event);
+  publishRoleEvent('pharmacist', 'patient.address-updated', event);
+  publishAdminEvent('patient.address-updated', event);
   return res.json(successResponse('Delivery address saved.', { deliveryAddress: user.deliveryAddress }));
 });
 

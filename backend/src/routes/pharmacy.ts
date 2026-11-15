@@ -6,6 +6,8 @@ import { User } from '../models/User';
 import { Prescription, type PrescriptionItem } from '../models/Prescription';
 import { requireAuth, AuthenticatedRequest, requireRole } from '../middleware/auth';
 import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realtime/socket';
+import { clearOrderInventoryDeductions, deductOrderInventory } from '../services/inventory';
+import { recordAudit } from '../utils/audit';
 import { verifyPrescriptionSignature } from '../utils/prescriptionSignature';
 import { successResponse } from '../utils/response';
 
@@ -80,7 +82,14 @@ router.patch('/orders/:id/bill', requireAuth, requireRole('pharmacist', 'admin')
   order.status = 'BILL_GENERATED';
   await order.save();
   const event = { pharmacyOrderId: order.id, patientId: order.patientId.toString(), status: order.status, total: order.total };
+  await recordAudit(req, {
+    action: 'pharmacy.bill_generated',
+    entityType: 'pharmacyOrder',
+    entityId: order.id,
+    details: { total: order.total, itemCount: order.items.length },
+  });
   publishUserEvent(order.patientId.toString(), 'pharmacy.bill-generated', event);
+  publishRoleEvent('pharmacist', 'pharmacy.bill-generated', event);
   publishAdminEvent('pharmacy.bill-generated', event);
   return res.json(successResponse('Pharmacy bill generated after checking medicine availability.', order));
 });
@@ -88,12 +97,11 @@ router.patch('/orders/:id/bill', requireAuth, requireRole('pharmacist', 'admin')
 const transitions: Partial<Record<PharmacyOrderStatus, PharmacyOrderStatus[]>> = {
   PAID: ['PREPARING'],
   PREPARING: ['READY_FOR_PICKUP', 'READY_FOR_DISPATCH'],
-  READY_FOR_PICKUP: ['COLLECTED'],
 };
 
 const statusSchema = z.object({ status: z.enum(pharmacyOrderStatuses) });
 
-router.patch('/orders/:id/status', requireAuth, requireRole('pharmacist', 'admin'), async (req, res) => {
+router.patch('/orders/:id/status', requireAuth, requireRole('pharmacist', 'admin'), async (req: AuthenticatedRequest, res) => {
   const parsed = statusSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ success: false, message: 'Invalid order status.' });
@@ -108,12 +116,87 @@ router.patch('/orders/:id/status', requireAuth, requireRole('pharmacist', 'admin
     return res.status(409).json({ success: false, message: 'That order status transition is not allowed.' });
   }
 
-  order.status = parsed.data.status;
-  await order.save();
-  const event = { pharmacyOrderId: order.id, patientId: order.patientId.toString(), status: order.status };
+  let updatedOrder: PharmacyOrderDocument | null = null;
+  if (parsed.data.status === 'PREPARING') {
+    const deduction = await deductOrderInventory(order);
+    if (!deduction.success) {
+      return res.status(409).json({ success: false, message: deduction.message });
+    }
+    updatedOrder = await PharmacyOrder.findOneAndUpdate(
+      { _id: order._id, status: 'PAID' },
+      { $set: { status: 'PREPARING', stockDeductedAt: new Date() } },
+      { new: true },
+    );
+    if (!updatedOrder) {
+      const currentOrder = await PharmacyOrder.findById(order._id);
+      if (currentOrder?.status === 'PREPARING' && currentOrder.stockDeductedAt) updatedOrder = currentOrder;
+    }
+  } else if (parsed.data.status === 'READY_FOR_DISPATCH') {
+    if (!order.stockDeductedAt) {
+      return res.status(409).json({ success: false, message: 'Inventory must be deducted before dispatch.' });
+    }
+    let deliveryAddress = order.deliveryAddress;
+    if (!deliveryAddress?.trim()) {
+      const patient = await User.findById(order.patientId).select('deliveryAddress');
+      deliveryAddress = patient?.deliveryAddress;
+    }
+    if (!deliveryAddress?.trim()) {
+      return res.status(409).json({ success: false, message: 'Patient delivery address is missing. Ask the patient to save an address or prepare this order for pickup.' });
+    }
+    updatedOrder = await PharmacyOrder.findOneAndUpdate(
+      { _id: order._id, status: 'PREPARING', stockDeductedAt: { $exists: true } },
+      { $set: { status: 'READY_FOR_DISPATCH', deliveryAddress } },
+      { new: true },
+    );
+  } else if (parsed.data.status === 'READY_FOR_PICKUP') {
+    if (!order.stockDeductedAt) {
+      return res.status(409).json({ success: false, message: 'Inventory must be deducted before pickup.' });
+    }
+    updatedOrder = await PharmacyOrder.findOneAndUpdate(
+      { _id: order._id, status: 'PREPARING', stockDeductedAt: { $exists: true } },
+      {
+        $set: {
+          status: 'READY_FOR_PICKUP',
+        },
+      },
+      { new: true },
+    );
+  }
+  if (!updatedOrder) {
+    return res.status(409).json({ success: false, message: 'The pharmacy order changed. Refresh and try again.' });
+  }
+  await recordAudit(req, {
+    action: `pharmacy.order_${updatedOrder.status.toLowerCase()}`,
+    entityType: 'pharmacyOrder',
+    entityId: updatedOrder._id.toString(),
+    details: { status: updatedOrder.status },
+  });
+  const event = { pharmacyOrderId: updatedOrder._id.toString(), patientId: updatedOrder.patientId.toString(), status: updatedOrder.status };
   publishUserEvent(order.patientId.toString(), 'pharmacy.order-status', event);
+  publishRoleEvent('pharmacist', 'pharmacy.order-status', event);
   publishAdminEvent('pharmacy.order-status', event);
-  return res.json(successResponse('Order status updated.', order));
+  return res.json(successResponse('Order status updated.', updatedOrder));
+});
+
+router.post('/orders/:id/collect', requireAuth, requireRole('pharmacist', 'admin'), async (req: AuthenticatedRequest, res) => {
+  const collected = await PharmacyOrder.findOneAndUpdate(
+    { _id: req.params.id, status: 'READY_FOR_PICKUP' },
+    { $set: { status: 'COLLECTED', collectedAt: new Date() } },
+    { new: true },
+  );
+  if (!collected) {
+    if (!await PharmacyOrder.exists({ _id: req.params.id })) {
+      return res.status(404).json({ success: false, message: 'Pickup-ready order not found.' });
+    }
+    return res.status(409).json({ success: false, message: 'The pharmacy order changed. Refresh and try again.' });
+  }
+  await clearOrderInventoryDeductions(collected.id);
+  await recordAudit(req, { action: 'pharmacy.order_collected', entityType: 'pharmacyOrder', entityId: collected.id });
+  const event = { pharmacyOrderId: collected.id, patientId: collected.patientId.toString(), status: collected.status };
+  publishUserEvent(event.patientId, 'pharmacy.order-status', event);
+  publishRoleEvent('pharmacist', 'pharmacy.order-status', event);
+  publishAdminEvent('pharmacy.order-collected', event);
+  return res.json(successResponse('Pickup marked collected.', collected));
 });
 
 router.get('/inventory', requireAuth, requireRole('pharmacist', 'admin'), async (_req, res) => {
@@ -130,25 +213,38 @@ const createInventorySchema = z.object({
   lowStockThreshold: z.number().int().min(0).default(10),
 });
 
-router.post('/inventory', requireAuth, requireRole('pharmacist', 'admin'), async (req, res) => {
+router.post('/inventory', requireAuth, requireRole('pharmacist', 'admin'), async (req: AuthenticatedRequest, res) => {
   const parsed = createInventorySchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ success: false, message: 'Enter a medicine name and valid stock values.' });
   }
+  const inventoryNames = await InventoryItem.find().select('medicine').lean();
+  if (inventoryNames.some((item) => item.medicine.trim().toLowerCase() === parsed.data.medicine.toLowerCase())) {
+    return res.status(409).json({ success: false, message: 'That medicine is already in inventory.' });
+  }
+  let item;
   try {
-    const item = await InventoryItem.create(parsed.data);
-    return res.status(201).json(successResponse('Medicine added to inventory.', item));
+    item = await InventoryItem.create(parsed.data);
   } catch (error) {
     if (typeof error === 'object' && error !== null && 'code' in error && error.code === 11000) {
       return res.status(409).json({ success: false, message: 'That medicine is already in inventory.' });
     }
     throw error;
   }
+  await recordAudit(req, {
+    action: 'pharmacy.inventory_created',
+    entityType: 'inventoryItem',
+    entityId: item.id,
+    details: { medicine: item.medicine, openingStock: item.stock },
+  });
+  publishRoleEvent('pharmacist', 'pharmacy.inventory-updated', { inventoryItemId: item.id });
+  publishAdminEvent('pharmacy.inventory-updated', { inventoryItemId: item.id });
+  return res.status(201).json(successResponse('Medicine added to inventory.', item));
 });
 
 const inventorySchema = z.object({ stock: z.number().int().min(0) });
 
-router.patch('/inventory/:id', requireAuth, requireRole('pharmacist', 'admin'), async (req, res) => {
+router.patch('/inventory/:id', requireAuth, requireRole('pharmacist', 'admin'), async (req: AuthenticatedRequest, res) => {
   const parsed = inventorySchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ success: false, message: 'Stock must be a non-negative whole number.' });
@@ -159,9 +255,43 @@ router.patch('/inventory/:id', requireAuth, requireRole('pharmacist', 'admin'), 
     return res.status(404).json({ success: false, message: 'Inventory item not found.' });
   }
 
+  await recordAudit(req, {
+    action: 'pharmacy.inventory_adjusted',
+    entityType: 'inventoryItem',
+    entityId: item._id.toString(),
+    details: { newStock: item.stock },
+  });
+  publishRoleEvent('pharmacist', 'pharmacy.inventory-updated', { inventoryItemId: item._id.toString() });
+  publishAdminEvent('pharmacy.inventory-updated', { inventoryItemId: item._id.toString() });
   return res.json(successResponse('Inventory updated.', item));
 });
 
+const restockSchema = z.object({
+  quantity: z.number().int().positive().max(1_000_000),
+  reason: z.string().trim().min(3).max(300),
+});
+
+router.patch('/inventory/:id/restock', requireAuth, requireRole('pharmacist', 'admin'), async (req: AuthenticatedRequest, res) => {
+  const parsed = restockSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ success: false, message: 'Enter a positive restock quantity and a reason.' });
+  }
+  const item = await InventoryItem.findByIdAndUpdate(
+    req.params.id,
+    { $inc: { stock: parsed.data.quantity } },
+    { new: true },
+  );
+  if (!item) return res.status(404).json({ success: false, message: 'Inventory item not found.' });
+  await recordAudit(req, {
+    action: 'pharmacy.inventory_restocked',
+    entityType: 'inventoryItem',
+    entityId: item.id,
+    details: { quantity: parsed.data.quantity, reason: parsed.data.reason, stock: item.stock },
+  });
+  publishRoleEvent('pharmacist', 'pharmacy.inventory-updated', { inventoryItemId: item.id });
+  publishAdminEvent('pharmacy.inventory-updated', { inventoryItemId: item.id });
+  return res.json(successResponse('Inventory restocked.', item));
+});
 const assignSchema = z.object({ deliveryUserId: z.string().regex(/^[a-f\d]{24}$/i) });
 
 router.patch('/orders/:id/assign', requireAuth, requireRole('pharmacist', 'admin'), async (req: AuthenticatedRequest, res) => {
@@ -189,16 +319,28 @@ router.patch('/orders/:id/assign', requireAuth, requireRole('pharmacist', 'admin
 
   const order = await PharmacyOrder.findOneAndUpdate(
     { _id: req.params.id, status: 'READY_FOR_DISPATCH' },
-    { $set: { assignedDeliveryId: parsed.data.deliveryUserId, status: 'OUT_FOR_DELIVERY' } },
+    {
+      $set: {
+        assignedDeliveryId: parsed.data.deliveryUserId,
+        status: 'OUT_FOR_DELIVERY',
+      },
+    },
     { new: true },
   );
   if (!order) {
     return res.status(404).json({ success: false, message: 'Dispatch-ready order not found.' });
   }
 
+  await recordAudit(req, {
+    action: 'delivery.assigned',
+    entityType: 'pharmacyOrder',
+    entityId: order.id,
+    details: { deliveryUserId: parsed.data.deliveryUserId },
+  });
   const event = { pharmacyOrderId: order.id, patientId: order.patientId.toString(), status: order.status };
   publishUserEvent(parsed.data.deliveryUserId, 'delivery.assigned', event);
   publishRoleEvent('deliveryBoy', 'delivery.assigned', event);
+  publishRoleEvent('pharmacist', 'delivery.assigned', event);
   publishUserEvent(order.patientId.toString(), 'delivery.assigned', event);
   publishAdminEvent('delivery.assigned', event);
   return res.json(successResponse('Delivery assigned.', order));

@@ -1,9 +1,28 @@
 import mongoose from 'mongoose';
 import { env } from './env';
 import { Department, InventoryItem } from '../models/Clinic';
+import { Appointment } from '../models/Appointment';
 
 export const connectDatabase = async () => {
   await mongoose.connect(env.mongoUri);
+  const appointmentIndexes = await Appointment.collection.indexes();
+  const obsoleteSlotIndex = appointmentIndexes.find((index) =>
+    index.unique
+      && index.key.doctorId === 1
+      && index.key.slot === 1
+      && !index.partialFilterExpression,
+  );
+  if (obsoleteSlotIndex?.name) {
+    await Appointment.collection.dropIndex(obsoleteSlotIndex.name);
+  }
+  await Appointment.collection.createIndex(
+    { doctorId: 1, slot: 1 },
+    {
+      name: 'active_doctor_slot',
+      unique: true,
+      partialFilterExpression: { status: { $in: ['REQUESTED', 'PAYMENT_PENDING', 'CONFIRMED'] } },
+    },
+  );
   await Promise.all([
     Department.bulkWrite([
       { updateOne: { filter: { code: 'CARD' }, update: { $setOnInsert: { name: 'Cardiology', code: 'CARD', description: 'Heart and vascular care' } }, upsert: true } },

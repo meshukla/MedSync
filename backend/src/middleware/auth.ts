@@ -3,6 +3,7 @@ import jwt, { JsonWebTokenError, TokenExpiredError } from 'jsonwebtoken';
 import { env } from '../config/env';
 import { AuthSession } from '../models/AuthSession';
 import { User, UserRole } from '../models/User';
+import { accessCookieName, getTabSessionId, TAB_SESSION_HEADER } from '../utils/tabSession';
 
 export type AuthenticatedRequest = Request & {
   user?: {
@@ -14,7 +15,8 @@ export type AuthenticatedRequest = Request & {
 
 export const requireAuth = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization;
-  const token = req.cookies?.medsyncAccessToken
+  const tabSessionId = getTabSessionId(req.header(TAB_SESSION_HEADER));
+  const token = (tabSessionId ? req.cookies?.[accessCookieName(tabSessionId)] : null)
     || (authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null);
 
   if (!token) {
