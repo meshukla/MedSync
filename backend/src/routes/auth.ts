@@ -13,6 +13,7 @@ import { disconnectSessionFamily, publishAdminEvent } from '../realtime/socket';
 import { accessCookieName, getTabSessionId, refreshCookieName, TAB_SESSION_HEADER } from '../utils/tabSession';
 import { successResponse } from '../utils/response';
 import { hashPassword } from '../utils/password';
+import { notifyRole, notifyUsers } from '../services/userNotifications';
 
 const router = Router();
 
@@ -208,6 +209,13 @@ router.post('/register', async (req, res) => {
   }
 
   publishAdminEvent('patient.registered', { userId: user.id });
+  await notifyRole('admin', {
+    event: 'patient.registered',
+    title: 'New patient registration',
+    message: `Patient ${user.name} registered and is awaiting email verification.`,
+    metadata: { userId: user.id },
+    dedupeKey: `patient-registered:${user.id}`,
+  });
 
   try {
     const sent = await sendOtp(normalizedEmail);
@@ -307,6 +315,17 @@ router.post('/otp/verify', async (req, res) => {
     }
   } else {
     publishAdminEvent('patient.email-verified', { userId: user.id });
+    await notifyUsers([user.id], {
+      event: 'registration.successful',
+      title: 'Registration successful',
+      message: 'Your MedSync account is ready to use.',
+      metadata: { userId: user.id },
+      dedupeKey: `registration-success:${user.id}`,
+      email: {
+        subject: 'Welcome to MedSync',
+        text: 'Your MedSync registration is complete. You can now sign in to manage your appointments and prescriptions.',
+      },
+    });
   }
 
   return res.json(successResponse('Email verified. You can now sign in.'));

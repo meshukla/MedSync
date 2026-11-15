@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { Appointment } from '../models/Appointment';
 import { Department, Doctor } from '../models/Clinic';
-import { Payment } from '../models/Payment';
+import { Payment, type PaymentDocument } from '../models/Payment';
 import { PharmacyOrder } from '../models/PharmacyOrder';
 import { User } from '../models/User';
 import { requireAuth, AuthenticatedRequest, requireRole } from '../middleware/auth';
@@ -10,6 +10,8 @@ import { env } from '../config/env';
 import { getRazorpayClient, PaymentConfigurationError } from '../services/razorpay';
 import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realtime/socket';
 import { successResponse } from '../utils/response';
+import { notifyUsers } from '../services/userNotifications';
+import { queueAppointmentReminder } from '../services/notifications';
 import { recordAudit } from '../utils/audit';
 import { requestFullRefund } from '../services/refunds';
 import { clinicDateTimeToDate, getClinicDate, getClinicSlots, isValidClinicDate } from '../utils/clinicSchedule';
@@ -113,6 +115,38 @@ router.post('/appointments', requireAuth, requireRole('patient'), async (req: Au
     if (!existingAppointment) {
       return res.status(409).json({ success: false, message: 'The previous booking request could not be recovered.' });
     }
+    const existingDoctor = await Doctor.findById(existingAppointment.doctorId).select('name userId');
+    if (existingDoctor) {
+      const event = {
+        appointmentId: existingAppointment.id,
+        patientId: existingAppointment.patientId.toString(),
+        status: existingAppointment.status,
+        slot: existingAppointment.slot.toISOString(),
+      };
+      const appointmentTime = existingAppointment.slot.toLocaleString('en-IN', { timeZone: env.clinicTimeZone });
+      await notifyUsers([existingAppointment.patientId.toString()], {
+        event: 'appointment.booked',
+        title: 'Appointment booked',
+        message: `Your appointment with ${existingDoctor.name} is reserved for ${appointmentTime}. Complete payment to confirm it.`,
+        metadata: event,
+        dedupeKey: `appointment-booked:${existingAppointment.id}`,
+        email: {
+          subject: 'Your MedSync appointment is booked',
+          text: `Your appointment with ${existingDoctor.name} is reserved for ${appointmentTime}. Complete payment to confirm it.`,
+        },
+      });
+      await notifyUsers([existingDoctor.userId.toString()], {
+        event: 'appointment.requested',
+        title: 'New appointment request',
+        message: `A patient requested an appointment for ${appointmentTime}.`,
+        metadata: event,
+        dedupeKey: `appointment-requested:${existingAppointment.id}`,
+        email: {
+          subject: 'New MedSync appointment request',
+          text: `A patient requested an appointment with you for ${appointmentTime}.`,
+        },
+      });
+    }
     return res.json(successResponse('Existing appointment checkout loaded.', {
       appointment: existingAppointment,
       checkout: {
@@ -160,6 +194,7 @@ router.post('/appointments', requireAuth, requireRole('patient'), async (req: Au
     throw error;
   }
 
+  let payment: PaymentDocument;
   try {
     const amountPaise = Math.round(doctor.fee * 100);
     if (amountPaise < 1) {
@@ -171,7 +206,7 @@ router.post('/appointments', requireAuth, requireRole('patient'), async (req: Au
       receipt: appointment.id,
       notes: { appointmentId: appointment.id, patientId: req.user?.id || '' },
     });
-    const payment = await Payment.create({
+    payment = await Payment.create({
       patientId: req.user?.id,
       appointmentId: appointment.id,
       providerOrderId: order.id,
@@ -180,17 +215,6 @@ router.post('/appointments', requireAuth, requireRole('patient'), async (req: Au
       status: 'CREATED',
       idempotencyKey,
     });
-    const appointmentEvent = {
-      appointmentId: appointment.id,
-      status: appointment.status,
-      slot: appointment.slot.toISOString(),
-    };
-    publishUserEvent(doctor.userId.toString(), 'appointment.created', appointmentEvent);
-    publishAdminEvent('appointment.created', appointmentEvent);
-    return res.status(201).json(successResponse('Appointment reserved. Complete payment to confirm it.', {
-      appointment,
-      checkout: { keyId: env.razorpayKeyId, orderId: payment.providerOrderId, amount: amountPaise, currency: 'INR' },
-    }));
   } catch (error) {
     await Appointment.deleteOne({ _id: appointment._id, status: 'PAYMENT_PENDING' });
     if (error instanceof PaymentConfigurationError) {
@@ -198,6 +222,43 @@ router.post('/appointments', requireAuth, requireRole('patient'), async (req: Au
     }
     throw error;
   }
+
+  const appointmentEvent = {
+    appointmentId: appointment.id,
+    patientId: appointment.patientId.toString(),
+    status: appointment.status,
+    slot: appointment.slot.toISOString(),
+  };
+  const patient = await User.findById(appointment.patientId).select('name');
+  const appointmentTime = appointment.slot.toLocaleString('en-IN', { timeZone: env.clinicTimeZone });
+  await notifyUsers([appointment.patientId.toString()], {
+    event: 'appointment.booked',
+    title: 'Appointment booked',
+    message: `Your appointment with ${doctor.name} is reserved for ${appointmentTime}. Complete payment to confirm it.`,
+    metadata: appointmentEvent,
+    dedupeKey: `appointment-booked:${appointment.id}`,
+    email: {
+      subject: 'Your MedSync appointment is booked',
+      text: `Your appointment with ${doctor.name} is reserved for ${appointmentTime}. Complete payment to confirm it.`,
+    },
+  });
+  await notifyUsers([doctor.userId.toString()], {
+    event: 'appointment.requested',
+    title: 'New appointment request',
+    message: `${patient?.name || 'A patient'} requested an appointment for ${appointmentTime}.`,
+    metadata: appointmentEvent,
+    dedupeKey: `appointment-requested:${appointment.id}`,
+    email: {
+      subject: 'New MedSync appointment request',
+      text: `${patient?.name || 'A patient'} requested an appointment with you for ${appointmentTime}.`,
+    },
+  });
+  publishUserEvent(doctor.userId.toString(), 'appointment.created', appointmentEvent);
+  publishAdminEvent('appointment.created', appointmentEvent);
+  return res.status(201).json(successResponse('Appointment reserved. Complete payment to confirm it.', {
+    appointment,
+    checkout: { keyId: env.razorpayKeyId, orderId: payment.providerOrderId, amount: payment.amountPaise, currency: 'INR' },
+  }));
 });
 
 const rescheduleSchema = z.object({
@@ -266,6 +327,7 @@ router.patch('/appointments/:id/reschedule', requireAuth, requireRole('patient')
   publishUserEvent(req.user?.id || '', 'appointment.rescheduled', event);
   publishUserEvent(doctor.userId.toString(), 'appointment.rescheduled', event);
   publishAdminEvent('appointment.rescheduled', event);
+  await queueAppointmentReminder(updatedAppointment.id);
   return res.json(successResponse('Appointment rescheduled.', updatedAppointment));
 });
 
@@ -327,6 +389,19 @@ router.patch('/appointments/:id/cancel', requireAuth, requireRole('patient'), as
   publishUserEvent(req.user?.id || '', 'appointment.cancelled', appointmentEvent);
   if (doctor) publishUserEvent(doctor.userId.toString(), 'appointment.cancelled', appointmentEvent);
   publishAdminEvent('appointment.cancelled', appointmentEvent);
+  if (doctor) {
+    await notifyUsers([doctor.userId.toString()], {
+      event: 'appointment.cancelled',
+      title: 'Patient cancelled an appointment',
+      message: `A patient cancelled the appointment scheduled for ${appointment.slot.toLocaleString('en-IN', { timeZone: env.clinicTimeZone })}.`,
+      metadata: appointmentEvent,
+      dedupeKey: `appointment-cancelled:${appointment.id}`,
+      email: {
+        subject: 'MedSync appointment cancelled',
+        text: `A patient cancelled the appointment scheduled for ${appointment.slot.toLocaleString('en-IN', { timeZone: env.clinicTimeZone })}.`,
+      },
+    });
+  }
   return res.json(successResponse('Appointment cancelled.', cancelledAppointment));
 });
 

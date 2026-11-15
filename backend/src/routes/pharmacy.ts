@@ -10,6 +10,7 @@ import { clearOrderInventoryDeductions, deductOrderInventory } from '../services
 import { recordAudit } from '../utils/audit';
 import { verifyPrescriptionSignature } from '../utils/prescriptionSignature';
 import { successResponse } from '../utils/response';
+import { notifyRole, notifyUsers } from '../services/userNotifications';
 
 const router = Router();
 
@@ -91,6 +92,17 @@ router.patch('/orders/:id/bill', requireAuth, requireRole('pharmacist', 'admin')
   publishUserEvent(order.patientId.toString(), 'pharmacy.bill-generated', event);
   publishRoleEvent('pharmacist', 'pharmacy.bill-generated', event);
   publishAdminEvent('pharmacy.bill-generated', event);
+  await notifyUsers([order.patientId.toString()], {
+    event: 'pharmacy.bill-generated',
+    title: 'Medicine bill generated',
+    message: `Your medicine bill of ₹${order.total.toFixed(2)} is ready for payment.`,
+    metadata: event,
+    dedupeKey: `pharmacy-bill:${order.id}`,
+    email: {
+      subject: 'Your MedSync medicine bill is ready',
+      text: `Your medicine bill of ₹${order.total.toFixed(2)} is ready. Sign in to MedSync to review and pay.`,
+    },
+  });
   return res.json(successResponse('Pharmacy bill generated after checking medicine availability.', order));
 });
 
@@ -175,6 +187,42 @@ router.patch('/orders/:id/status', requireAuth, requireRole('pharmacist', 'admin
   publishUserEvent(order.patientId.toString(), 'pharmacy.order-status', event);
   publishRoleEvent('pharmacist', 'pharmacy.order-status', event);
   publishAdminEvent('pharmacy.order-status', event);
+  if (updatedOrder.status === 'PREPARING') {
+    await notifyRole('pharmacist', {
+      event: 'pharmacy.preparation-required',
+      title: 'Medicine preparation required',
+      message: `Prepare the medicines for order ${updatedOrder._id.toString()}.`,
+      metadata: event,
+      dedupeKey: `pharmacy-preparation:${updatedOrder._id.toString()}`,
+    });
+  } else if (updatedOrder.status === 'READY_FOR_PICKUP') {
+    await notifyUsers([order.patientId.toString()], {
+      event: 'pharmacy.ready-for-pickup',
+      title: 'Medicines ready for pickup',
+      message: 'Your medicines are ready for pickup at the pharmacy.',
+      metadata: event,
+      dedupeKey: `pharmacy-ready-pickup-patient:${updatedOrder._id.toString()}`,
+      email: {
+        subject: 'Your MedSync medicines are ready for pickup',
+        text: 'Your medicines are ready for pickup at the pharmacy.',
+      },
+    });
+    await notifyRole('pharmacist', {
+      event: 'pharmacy.ready-for-pickup',
+      title: 'Order ready for pickup',
+      message: `Order ${updatedOrder._id.toString()} is ready for pickup.`,
+      metadata: event,
+      dedupeKey: `pharmacy-ready-pickup-staff:${updatedOrder._id.toString()}`,
+    });
+  } else if (updatedOrder.status === 'READY_FOR_DISPATCH') {
+    await notifyRole('pharmacist', {
+      event: 'delivery.assignment-required',
+      title: 'Delivery assignment required',
+      message: `Order ${updatedOrder._id.toString()} is ready to be assigned for delivery.`,
+      metadata: event,
+      dedupeKey: `delivery-assignment-required:${updatedOrder._id.toString()}`,
+    });
+  }
   return res.json(successResponse('Order status updated.', updatedOrder));
 });
 
@@ -239,6 +287,18 @@ router.post('/inventory', requireAuth, requireRole('pharmacist', 'admin'), async
   });
   publishRoleEvent('pharmacist', 'pharmacy.inventory-updated', { inventoryItemId: item.id });
   publishAdminEvent('pharmacy.inventory-updated', { inventoryItemId: item.id });
+  if (item.stock <= item.lowStockThreshold) {
+    await notifyRole('admin', {
+      event: 'inventory.low-stock',
+      title: 'Low medicine stock',
+      message: `${item.medicine} is low in stock (${item.stock} remaining; threshold ${item.lowStockThreshold}).`,
+      metadata: { inventoryItemId: item.id, stock: item.stock, threshold: item.lowStockThreshold },
+      email: {
+        subject: 'MedSync low medicine stock alert',
+        text: `${item.medicine} is low in stock (${item.stock} remaining; threshold ${item.lowStockThreshold}).`,
+      },
+    });
+  }
   return res.status(201).json(successResponse('Medicine added to inventory.', item));
 });
 
@@ -250,9 +310,17 @@ router.patch('/inventory/:id', requireAuth, requireRole('pharmacist', 'admin'), 
     return res.status(400).json({ success: false, message: 'Stock must be a non-negative whole number.' });
   }
 
-  const item = await InventoryItem.findByIdAndUpdate(req.params.id, { $set: { stock: parsed.data.stock } }, { new: true }).lean();
-  if (!item) {
+  const previous = await InventoryItem.findById(req.params.id).select('medicine stock lowStockThreshold');
+  if (!previous) {
     return res.status(404).json({ success: false, message: 'Inventory item not found.' });
+  }
+  const item = await InventoryItem.findOneAndUpdate(
+    { _id: previous._id, stock: previous.stock },
+    { $set: { stock: parsed.data.stock } },
+    { new: true },
+  ).lean();
+  if (!item) {
+    return res.status(409).json({ success: false, message: 'Inventory stock changed. Refresh and try again.' });
   }
 
   await recordAudit(req, {
@@ -263,6 +331,18 @@ router.patch('/inventory/:id', requireAuth, requireRole('pharmacist', 'admin'), 
   });
   publishRoleEvent('pharmacist', 'pharmacy.inventory-updated', { inventoryItemId: item._id.toString() });
   publishAdminEvent('pharmacy.inventory-updated', { inventoryItemId: item._id.toString() });
+  if (previous.stock > previous.lowStockThreshold && item.stock <= item.lowStockThreshold) {
+    await notifyRole('admin', {
+      event: 'inventory.low-stock',
+      title: 'Low medicine stock',
+      message: `${item.medicine} is low in stock (${item.stock} remaining; threshold ${item.lowStockThreshold}).`,
+      metadata: { inventoryItemId: item._id.toString(), stock: item.stock, threshold: item.lowStockThreshold },
+      email: {
+        subject: 'MedSync low medicine stock alert',
+        text: `${item.medicine} is low in stock (${item.stock} remaining; threshold ${item.lowStockThreshold}).`,
+      },
+    });
+  }
   return res.json(successResponse('Inventory updated.', item));
 });
 
@@ -303,8 +383,10 @@ router.patch('/orders/:id/assign', requireAuth, requireRole('pharmacist', 'admin
     return res.status(404).json({ success: false, message: 'Active delivery account not found.' });
   }
 
-  const readyOrder = await PharmacyOrder.findOne({ _id: req.params.id, status: 'READY_FOR_DISPATCH' })
-    .select('patientId deliveryAddress');
+  const readyOrder = await PharmacyOrder.findOne({
+    _id: req.params.id,
+    status: { $in: ['READY_FOR_DISPATCH', 'OUT_FOR_DELIVERY'] },
+  }).select('patientId deliveryAddress assignedDeliveryId status');
   if (!readyOrder) {
     return res.status(404).json({ success: false, message: 'Dispatch-ready order not found.' });
   }
@@ -317,12 +399,19 @@ router.patch('/orders/:id/assign', requireAuth, requireRole('pharmacist', 'admin
     await readyOrder.save();
   }
 
+  const oldDeliveryId = readyOrder.assignedDeliveryId?.toString();
+  const reassigned = readyOrder.status === 'OUT_FOR_DELIVERY'
+    && Boolean(oldDeliveryId)
+    && oldDeliveryId !== parsed.data.deliveryUserId;
+  if (readyOrder.status === 'OUT_FOR_DELIVERY' && !reassigned) {
+    return res.status(409).json({ success: false, message: 'Choose a different delivery person to reassign this order.' });
+  }
   const order = await PharmacyOrder.findOneAndUpdate(
-    { _id: req.params.id, status: 'READY_FOR_DISPATCH' },
+    { _id: req.params.id, status: readyOrder.status, assignedDeliveryId: readyOrder.assignedDeliveryId },
     {
       $set: {
         assignedDeliveryId: parsed.data.deliveryUserId,
-        status: 'OUT_FOR_DELIVERY',
+        ...(readyOrder.status === 'READY_FOR_DISPATCH' ? { status: 'OUT_FOR_DELIVERY' } : {}),
       },
     },
     { new: true },
@@ -338,6 +427,48 @@ router.patch('/orders/:id/assign', requireAuth, requireRole('pharmacist', 'admin
     details: { deliveryUserId: parsed.data.deliveryUserId },
   });
   const event = { pharmacyOrderId: order.id, patientId: order.patientId.toString(), status: order.status };
+  await notifyUsers([parsed.data.deliveryUserId], {
+    event: reassigned ? 'delivery.reassigned' : 'delivery.assigned',
+    title: reassigned ? 'Delivery reassigned to you' : 'New delivery assigned',
+    message: `Order ${order.id} is assigned to you for delivery.`,
+    metadata: event,
+    dedupeKey: `delivery-assigned:${order.id}:${parsed.data.deliveryUserId}`,
+    email: {
+      subject: reassigned ? 'MedSync delivery reassigned to you' : 'New MedSync delivery assigned',
+      text: `Order ${order.id} has been assigned to you for delivery. Sign in to MedSync to view the delivery details.`,
+    },
+  });
+  await notifyUsers([parsed.data.deliveryUserId], {
+    event: 'delivery.details-available',
+    title: 'New delivery address/details',
+    message: `Delivery details for order ${order.id} are available in MedSync.`,
+    metadata: event,
+    dedupeKey: `delivery-details-available:${order.id}:${parsed.data.deliveryUserId}`,
+  });
+  if (reassigned && oldDeliveryId) {
+    await notifyUsers([oldDeliveryId], {
+      event: 'delivery.reassigned',
+      title: 'Delivery reassigned',
+      message: `Order ${order.id} has been reassigned to another delivery person.`,
+      metadata: event,
+      dedupeKey: `delivery-reassigned:${order.id}:${oldDeliveryId}:${parsed.data.deliveryUserId}`,
+      email: {
+        subject: 'MedSync delivery reassigned',
+        text: `Order ${order.id} has been reassigned to another delivery person.`,
+      },
+    });
+  }
+  await notifyUsers([order.patientId.toString()], {
+    event: 'delivery.assigned',
+    title: 'Delivery assigned',
+    message: reassigned ? 'Your medicine delivery has been reassigned.' : 'A delivery person has been assigned to your medicine order.',
+    metadata: event,
+    dedupeKey: `delivery-assigned-patient:${order.id}:${parsed.data.deliveryUserId}`,
+    email: {
+      subject: 'MedSync medicine delivery assigned',
+      text: reassigned ? 'Your medicine delivery has been reassigned.' : 'A delivery person has been assigned to your medicine order.',
+    },
+  });
   publishUserEvent(parsed.data.deliveryUserId, 'delivery.assigned', event);
   publishRoleEvent('deliveryBoy', 'delivery.assigned', event);
   publishRoleEvent('pharmacist', 'delivery.assigned', event);

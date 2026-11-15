@@ -10,6 +10,7 @@ import { Payment } from '../models/Payment';
 import { User } from '../models/User';
 import { getVideoIceServers } from './videoIceServers';
 import { accessCookieName, getTabSessionId } from '../utils/tabSession';
+import { notifyUsers } from '../services/userNotifications';
 
 type SocketUser = { id: string; role: string; familyId: string };
 type VideoRole = 'patient' | 'doctor';
@@ -197,6 +198,48 @@ export const initializeRealtime = (httpServer: HttpServer) => {
               iceServers: getVideoIceServers(user.id),
             });
             socket.to(room).emit('video:participant-joined', { role });
+            if (role === 'doctor' && peerRole === 'patient') {
+              void notifyUsers([appointment.patientId.toString()], {
+                event: 'consultation.started',
+                title: 'Doctor started your consultation',
+                message: 'Your doctor has joined the video consultation.',
+                metadata: { appointmentId: appointment.id },
+                dedupeKey: `consultation-started:${appointment.id}:${Date.now()}`,
+              }).catch((error: unknown) => {
+                console.error('Unable to notify patient that consultation started:', error);
+              });
+              void notifyUsers([user.id], {
+                event: 'consultation.patient-joined',
+                title: 'Patient joined video consultation',
+                message: 'Your patient has joined the video consultation.',
+                metadata: { appointmentId: appointment.id },
+                dedupeKey: `consultation-patient-joined:${appointment.id}:${Date.now()}`,
+              }).catch((error: unknown) => {
+                console.error('Unable to notify doctor that patient joined:', error);
+              });
+            } else if (role === 'patient' && peerRole === 'doctor') {
+              void notifyUsers([appointment.patientId.toString()], {
+                event: 'consultation.started',
+                title: 'Doctor started your consultation',
+                message: 'Your doctor is already in the video consultation.',
+                metadata: { appointmentId: appointment.id },
+                dedupeKey: `consultation-started:${appointment.id}:${Date.now()}`,
+              }).catch((error: unknown) => {
+                console.error('Unable to notify patient that consultation started:', error);
+              });
+              const doctor = await Doctor.findById(appointment.doctorId).select('userId');
+              if (doctor) {
+                void notifyUsers([doctor.userId.toString()], {
+                  event: 'consultation.patient-joined',
+                  title: 'Patient joined video consultation',
+                  message: 'Your patient has joined the video consultation.',
+                  metadata: { appointmentId: appointment.id },
+                  dedupeKey: `consultation-patient-joined:${appointment.id}:${Date.now()}`,
+                }).catch((error: unknown) => {
+                  console.error('Unable to notify doctor that patient joined:', error);
+                });
+              }
+            }
           } finally {
             videoJoinLocks.delete(appointment.id);
           }
@@ -303,6 +346,10 @@ export const disconnectSessionFamily = (familyId: string) => {
 export const publishUserEvent = (userId: string, event: string, payload: Record<string, unknown>) => {
   if (!io) throw new Error('Realtime service has not been initialized.');
   io.to(`user:${userId}`).emit('medsync:event', { event, ...payload });
+};
+
+export const publishUserEventIfAvailable = (userId: string, event: string, payload: Record<string, unknown>) => {
+  if (io) publishUserEvent(userId, event, payload);
 };
 
 export const publishAdminEvent = (event: string, payload: Record<string, unknown>) => {

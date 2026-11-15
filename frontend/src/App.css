@@ -17,6 +17,11 @@
 .topbar-actions { display: flex; align-items: center; gap: 14px; }
 .live-status { color: #a26610; font-size: .78rem; font-weight: 700; }
 .live-status.connected { color: #23804d; }
+.notification-count { padding: 7px 10px; border-radius: 999px; color: #245f9f; background: #eaf3ff; font-size: .75rem; font-weight: 800; white-space: nowrap; }
+.notifications-panel { margin-bottom: 20px; }
+.notifications-panel .record-list { max-height: 360px; overflow-y: auto; }
+.notification-record.unread { background: linear-gradient(90deg, #f3f8ff, #fff); }
+.notification-record small { display: block; margin-top: 5px; color: #97a2b1; font-size: .7rem; }
 .eyebrow { margin: 0 0 8px; color: #4787d1; font-size: .68rem; font-weight: 800; letter-spacing: .13em; }
 .topbar h1 { margin: 0; font-size: clamp(1.7rem, 3vw, 2.25rem); letter-spacing: -.045em; }
 .section-heading { margin-bottom: 20px; }

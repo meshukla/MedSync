@@ -13,6 +13,7 @@ import { successResponse } from '../utils/response';
 import { hashPassword } from '../utils/password';
 import { recordAudit } from '../utils/audit';
 import { requestFullRefund } from '../services/refunds';
+import { notifyRole } from '../services/userNotifications';
 
 const router = Router();
 
@@ -110,6 +111,20 @@ router.post('/users', requireAuth, requireRole('admin'), async (req: Authenticat
     details: { role },
   });
   publishAdminEvent('admin.staff-created', { userId: user.id, role });
+  if (role === 'doctor' || role === 'pharmacist' || role === 'deliveryBoy') {
+    const roleLabel = role === 'deliveryBoy' ? 'delivery boy' : role;
+    await notifyRole('admin', {
+      event: `staff.${role}.registered`,
+      title: `New ${roleLabel} registration`,
+      message: `${name} was added as a ${roleLabel}.`,
+      metadata: { userId: user.id, role },
+      dedupeKey: `staff-registered:${user.id}`,
+      email: {
+        subject: `New MedSync ${roleLabel} registered`,
+        text: `${name} was added as a ${roleLabel}.`,
+      },
+    });
+  }
   if (role === 'doctor') publishRoleEvent('patient', 'doctor.created', { userId: user.id });
   if (role === 'deliveryBoy') publishRoleEvent('pharmacist', 'delivery-staff.updated', { userId: user.id });
   return res.status(201).json(successResponse('Staff account created.', {

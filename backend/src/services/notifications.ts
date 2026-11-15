@@ -1,11 +1,14 @@
 import { Appointment } from '../models/Appointment';
 import { notificationQueue } from '../queues/notificationQueue';
 import { User } from '../models/User';
+import { Doctor } from '../models/Clinic';
 import { PharmacyOrder } from '../models/PharmacyOrder';
 import {
   APPOINTMENT_CONFIRMATION_JOB,
+  APPOINTMENT_REMINDER_JOB,
   PHARMACY_PRESCRIPTION_JOB,
 } from '../queues/notificationJobs';
+import { notifyUsers } from './userNotifications';
 
 export const queueAppointmentConfirmation = async (appointmentId: string) => {
   const appointment = await Appointment.findOne({
@@ -29,6 +32,54 @@ export const queueAppointmentConfirmation = async (appointmentId: string) => {
   })) {
     throw new Error('Unable to record the queued appointment confirmation notification.');
   }
+  return true;
+};
+
+export const queueAppointmentReminder = async (appointmentId: string) => {
+  const appointment = await Appointment.findOne({ _id: appointmentId, status: 'CONFIRMED' })
+    .select('_id slot');
+  if (!appointment) return false;
+  await notificationQueue.add(
+    APPOINTMENT_REMINDER_JOB,
+    { type: 'appointment-reminder', appointmentId, slot: appointment.slot.toISOString() },
+    {
+      jobId: `appointment-reminder-${appointmentId}-${appointment.slot.getTime()}`,
+      delay: Math.max(0, appointment.slot.getTime() - 5 * 60_000 - Date.now()),
+    },
+  );
+  return true;
+};
+
+export const sendAppointmentReminder = async (appointmentId: string, slot: string) => {
+  const appointment = await Appointment.findOne({
+    _id: appointmentId,
+    status: 'CONFIRMED',
+    slot: new Date(slot),
+  }).select('_id patientId doctorId slot doctorName');
+  if (!appointment) return false;
+  const doctor = await Doctor.findById(appointment.doctorId).select('userId');
+  if (!doctor) throw new Error('Doctor record for appointment reminder was not found.');
+
+  const when = appointment.slot.toISOString();
+  const patientMessage = `Your appointment with ${appointment.doctorName} starts in about 5 minutes.`;
+  const metadata = { appointmentId: appointment.id, slot: when };
+  await notifyUsers([appointment.patientId.toString()], {
+    event: 'appointment.reminder',
+    title: 'Appointment reminder',
+    message: patientMessage,
+    metadata,
+    dedupeKey: `appointment-reminder-patient:${appointment.id}:${appointment.slot.getTime()}`,
+    email: { subject: 'Your MedSync appointment starts soon', text: patientMessage },
+  });
+  const doctorMessage = 'You have a patient appointment starting in about 5 minutes.';
+  await notifyUsers([doctor.userId.toString()], {
+    event: 'appointment.reminder',
+    title: 'Upcoming appointment reminder',
+    message: doctorMessage,
+    metadata,
+    dedupeKey: `appointment-reminder-doctor:${appointment.id}:${appointment.slot.getTime()}`,
+    email: { subject: 'Upcoming MedSync appointment', text: doctorMessage },
+  });
   return true;
 };
 

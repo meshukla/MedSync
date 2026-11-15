@@ -1,6 +1,7 @@
 import { InventoryItem } from '../models/Clinic';
 import type { Types } from 'mongoose';
 import type { PharmacyOrderDocument } from '../models/PharmacyOrder';
+import { notifyRole } from './userNotifications';
 
 type DeductionResult = { success: true } | { success: false; message: string };
 
@@ -22,9 +23,10 @@ export const deductOrderInventory = async (order: PharmacyOrderDocument): Promis
   }
 
   const inventory = await InventoryItem.find()
-    .select('medicine stock deductedOrderIds')
+    .select('medicine stock lowStockThreshold deductedOrderIds')
     .lean();
   const newlyDeducted: { inventoryId: string; quantity: number; orderId: string }[] = [];
+  const lowStock: { medicine: string; stock: number; threshold: number }[] = [];
 
   for (const [medicine, required] of requiredByMedicine) {
     const matches = inventory.filter((item) => item.medicine.trim().toLowerCase() === medicine);
@@ -44,6 +46,10 @@ export const deductOrderInventory = async (order: PharmacyOrderDocument): Promis
     );
     if (updated.modifiedCount === 1) {
       newlyDeducted.push({ inventoryId: item._id.toString(), quantity: required, orderId });
+      const nextStock = item.stock - required;
+      if (item.stock > item.lowStockThreshold && nextStock <= item.lowStockThreshold) {
+        lowStock.push({ medicine: item.medicine, stock: nextStock, threshold: item.lowStockThreshold });
+      }
       continue;
     }
 
@@ -54,6 +60,19 @@ export const deductOrderInventory = async (order: PharmacyOrderDocument): Promis
       success: false,
       message: currentItem ? `Insufficient stock for ${medicine}.` : `Inventory item for ${medicine} was removed.`,
     };
+  }
+
+  for (const item of lowStock) {
+    await notifyRole('admin', {
+      event: 'inventory.low-stock',
+      title: 'Low medicine stock',
+      message: `${item.medicine} is low in stock (${item.stock} remaining; threshold ${item.threshold}).`,
+      metadata: item,
+      email: {
+        subject: 'MedSync low medicine stock alert',
+        text: `${item.medicine} is low in stock (${item.stock} remaining; threshold ${item.threshold}).`,
+      },
+    });
   }
 
   return { success: true };

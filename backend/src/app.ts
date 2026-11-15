@@ -11,6 +11,8 @@ import pharmacyRoutes from './routes/pharmacy';
 import deliveryRoutes from './routes/delivery';
 import doctorRoutes from './routes/doctors';
 import paymentRoutes from './routes/payments';
+import notificationRoutes from './routes/notifications';
+import { notifyCriticalIssue } from './services/userNotifications';
 
 const app = express();
 
@@ -32,9 +34,13 @@ app.use('/api/v1/doctors', doctorRoutes);
 app.use('/api/v1/pharmacy', pharmacyRoutes);
 app.use('/api/v1/delivery', deliveryRoutes);
 app.use('/api/v1/payments', paymentRoutes);
+app.use('/api/v1/notifications', notificationRoutes);
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error('Unhandled app error:', err);
+  void notifyCriticalIssue('api').catch((notificationError: unknown) => {
+    console.error('Unable to alert administrators about a backend error:', notificationError);
+  });
   res.status(500).json({ success: false, message: 'Internal server error.' });
 });
 

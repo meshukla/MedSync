@@ -7,6 +7,10 @@ import { closeRedis, connectRedis } from './config/redis';
 import { closeNotificationQueue } from './queues/notificationQueue';
 import { closeRealtime, initializeRealtime } from './realtime/socket';
 import { NotificationWorkerHandle, startNotificationWorker } from './workers/notificationWorker';
+import { notifyCriticalIssue } from './services/userNotifications';
+
+let shutdownCurrentServer: (signal: string) => Promise<void> = async () => {};
+let fatalErrorHandled = false;
 
 const startServer = async () => {
   let worker: NotificationWorkerHandle | undefined;
@@ -39,6 +43,7 @@ const startServer = async () => {
     }
     return shutdownPromise;
   };
+  shutdownCurrentServer = shutdown;
 
   try {
     await connectDatabase();
@@ -70,5 +75,28 @@ const startServer = async () => {
     process.exitCode = 1;
   }
 };
+
+const handleFatalError = (source: 'uncaught exception' | 'unhandled rejection', error: unknown) => {
+  if (fatalErrorHandled) return;
+  fatalErrorHandled = true;
+  console.error(`MedSync ${source}:`, error);
+  const exitTimer = setTimeout(() => process.exit(1), 10_000);
+  void notifyCriticalIssue('process')
+    .catch((notificationError: unknown) => {
+      console.error('Unable to alert administrators about a fatal process error:', notificationError);
+    })
+    .finally(async () => {
+      try {
+        await shutdownCurrentServer(source);
+      } catch (shutdownError) {
+        console.error('Unable to shut down after a fatal process error:', shutdownError);
+      }
+      clearTimeout(exitTimer);
+      process.exit(1);
+    });
+};
+
+process.once('uncaughtException', (error) => handleFatalError('uncaught exception', error));
+process.once('unhandledRejection', (reason) => handleFatalError('unhandled rejection', reason));
 
 void startServer();

@@ -5,6 +5,7 @@ import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realti
 import { clearOrderInventoryDeductions } from '../services/inventory';
 import { recordAudit } from '../utils/audit';
 import { successResponse } from '../utils/response';
+import { notifyUsers } from '../services/userNotifications';
 
 const router = Router();
 
@@ -39,6 +40,26 @@ router.patch('/assignments/:id/complete', requireAuth, requireRole('deliveryBoy'
   }
   publishRoleEvent('deliveryBoy', 'delivery.completed', event);
   publishAdminEvent('delivery.completed', event);
+  await notifyUsers([delivered.patientId.toString()], {
+    event: 'delivery.completed',
+    title: 'Medicines delivered',
+    message: 'Your medicine order has been delivered.',
+    metadata: event,
+    dedupeKey: `delivery-completed-patient:${delivered.id}`,
+    email: {
+      subject: 'Your MedSync medicines were delivered',
+      text: 'Your medicine order has been delivered.',
+    },
+  });
+  if (delivered.assignedDeliveryId) {
+    await notifyUsers([delivered.assignedDeliveryId.toString()], {
+      event: 'delivery.completed',
+      title: 'Delivery completed',
+      message: `You completed delivery for order ${delivered.id}.`,
+      metadata: event,
+      dedupeKey: `delivery-completed-boy:${delivered.id}`,
+    });
+  }
   return res.json(successResponse('Delivery marked complete.', delivered));
 });
 

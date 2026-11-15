@@ -6,15 +6,18 @@ import { Payment } from '../models/Payment';
 import { PharmacyOrder } from '../models/PharmacyOrder';
 import { Prescription } from '../models/Prescription';
 import { User } from '../models/User';
+import { env } from '../config/env';
 import { requireAuth, AuthenticatedRequest, requireRole } from '../middleware/auth';
 import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realtime/socket';
 import {
   queueAppointmentConfirmation,
+  queueAppointmentReminder,
   queuePharmacyPrescriptionNotifications,
 } from '../services/notifications';
 import { recordAudit } from '../utils/audit';
 import { signPrescription } from '../utils/prescriptionSignature';
 import { successResponse } from '../utils/response';
+import { notifyRole, notifyUsers } from '../services/userNotifications';
 
 const router = Router();
 
@@ -105,6 +108,28 @@ const prescriptionSchema = z.object({
 const isDuplicateKeyError = (error: unknown) =>
   typeof error === 'object' && error !== null && 'code' in error && error.code === 11000;
 
+const notifyPrescriptionCreated = async (patientId: string, prescriptionId: string, pharmacyOrderId: string, appointmentId: string) => {
+  const metadata = { appointmentId, pharmacyOrderId, prescriptionId, status: 'PRESCRIPTION_RECEIVED' };
+  await notifyUsers([patientId], {
+    event: 'prescription.generated',
+    title: 'Prescription generated',
+    message: 'Your doctor has signed a prescription. The pharmacy will prepare your medicine bill.',
+    metadata,
+    dedupeKey: `prescription-generated:${prescriptionId}`,
+    email: {
+      subject: 'Your MedSync prescription is ready',
+      text: 'Your doctor has signed a prescription. Sign in to MedSync to review it and track your medicine order.',
+    },
+  });
+  await notifyRole('pharmacist', {
+    event: 'prescription.received',
+    title: 'New prescription received',
+    message: `A new prescription is ready for pharmacy order ${pharmacyOrderId}.`,
+    metadata,
+    dedupeKey: `prescription-received:${prescriptionId}`,
+  });
+};
+
 router.post('/appointments/:id/prescription', requireAuth, requireRole('doctor'), async (req: AuthenticatedRequest, res) => {
   const appointmentId = z.string().regex(/^[a-f\d]{24}$/i).safeParse(req.params.id);
   const parsed = prescriptionSchema.safeParse(req.body);
@@ -126,6 +151,12 @@ router.post('/appointments/:id/prescription', requireAuth, requireRole('doctor')
       return res.status(409).json({ success: false, message: 'A prescription already exists for this appointment.' });
     }
     await queuePharmacyPrescriptionNotifications(existingOrder.id);
+    await notifyPrescriptionCreated(
+      existingPrescription.patientId.toString(),
+      existingPrescription.id,
+      existingOrder.id,
+      existingPrescription.appointmentId.toString(),
+    );
     return res.json(successResponse('Prescription already submitted to the pharmacy.', {
       prescriptionId: existingPrescription.id,
       pharmacyOrderId: existingOrder.id,
@@ -220,6 +251,7 @@ router.post('/appointments/:id/prescription', requireAuth, requireRole('doctor')
     prescriptionId: prescription.id,
     status: 'PRESCRIPTION_RECEIVED',
   };
+  await notifyPrescriptionCreated(patient.id, prescription.id, pharmacyOrder.id, appointment.id);
   publishUserEvent(patient.id, 'prescription.signed', event);
   publishRoleEvent('pharmacist', 'prescription.received', event);
   publishAdminEvent('prescription.received', event);
@@ -240,7 +272,7 @@ router.patch('/appointments/:id/status', requireAuth, requireRole('doctor'), asy
     return res.status(400).json({ success: false, message: 'Invalid appointment status.' });
   }
 
-  const doctor = await Doctor.findOne({ userId: req.user?.id }).select('_id');
+  const doctor = await Doctor.findOne({ userId: req.user?.id }).select('_id userId');
   if (!doctor) {
     return res.status(404).json({ success: false, message: 'Doctor profile not found.' });
   }
@@ -280,6 +312,23 @@ router.patch('/appointments/:id/status', requireAuth, requireRole('doctor'), asy
 
   if (appointment.status === 'CONFIRMED') {
     await queueAppointmentConfirmation(appointment.id);
+    await queueAppointmentReminder(appointment.id);
+    const confirmedEvent = { appointmentId: appointment.id, status: 'CONFIRMED' };
+    const appointmentTime = appointment.slot.toLocaleString('en-IN', { timeZone: env.clinicTimeZone });
+    await notifyUsers([appointment.patientId.toString()], {
+      event: 'appointment.confirmed',
+      title: 'Appointment confirmed',
+      message: `The appointment is confirmed for ${appointmentTime}.`,
+      metadata: confirmedEvent,
+      dedupeKey: `appointment-confirmed-patient:${appointment.id}`,
+    });
+    await notifyUsers([doctor.userId.toString()], {
+      event: 'appointment.confirmed',
+      title: 'Appointment confirmed',
+      message: `The appointment is confirmed for ${appointmentTime}.`,
+      metadata: confirmedEvent,
+      dedupeKey: `appointment-confirmed-doctor:${appointment.id}`,
+    });
   }
 
   const eventName = `appointment.${appointment.status.toLowerCase()}`;

@@ -51,6 +51,9 @@ const sendBrevoEmail = async (email: string, emailType: string, subject: string,
   }
 };
 
+export const sendNotificationEmail = (email: string, subject: string, textContent: string) =>
+  sendBrevoEmail(email, 'notification', subject, textContent);
+
 export const sendVerificationEmail = (email: string, code: string) =>
   sendBrevoEmail(
     email,

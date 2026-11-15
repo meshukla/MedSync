@@ -8,10 +8,11 @@ import { Payment } from '../models/Payment';
 import { AuditLog } from '../models/AuditLog';
 import { PharmacyOrder } from '../models/PharmacyOrder';
 import { Doctor } from '../models/Clinic';
-import { queueAppointmentConfirmation } from '../services/notifications';
+import { queueAppointmentConfirmation, queueAppointmentReminder } from '../services/notifications';
 import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realtime/socket';
 import { getRazorpayClient, PaymentConfigurationError } from '../services/razorpay';
 import { successResponse } from '../utils/response';
+import { notifyRole, notifyUsers } from '../services/userNotifications';
 
 const router = Router();
 
@@ -50,6 +51,41 @@ const announcePharmacyOrder = (order: { id: string; patientId: { toString(): str
   publishAdminEvent(event, payload);
 };
 
+const notifyAppointmentPaymentSuccess = async (appointment: {
+  id: string;
+  patientId: { toString(): string };
+  doctorId: { toString(): string };
+  slot: Date;
+}, amountPaise: number) => {
+  const event = { appointmentId: appointment.id, status: 'CONFIRMED' };
+  const when = appointment.slot.toLocaleString('en-IN', { timeZone: env.clinicTimeZone });
+  const doctor = await Doctor.findById(appointment.doctorId).select('userId');
+  await notifyUsers([appointment.patientId.toString()], {
+    event: 'appointment.confirmed',
+    title: 'Appointment confirmed',
+    message: `Your appointment is confirmed for ${when}.`,
+    metadata: event,
+    dedupeKey: `appointment-confirmed-patient:${appointment.id}`,
+  });
+  if (doctor) {
+    await notifyUsers([doctor.userId.toString()], {
+      event: 'appointment.confirmed',
+      title: 'Appointment confirmed',
+      message: `Your appointment with the patient is confirmed for ${when}.`,
+      metadata: event,
+      dedupeKey: `appointment-confirmed-doctor:${appointment.id}`,
+    });
+  }
+  await notifyUsers([appointment.patientId.toString()], {
+    event: 'payment.successful',
+    title: 'Payment successful',
+    message: 'Your appointment payment was successful.',
+    metadata: { appointmentId: appointment.id, amountPaise },
+    dedupeKey: `appointment-payment-success:${appointment.id}`,
+    email: { subject: 'MedSync appointment payment successful', text: 'Your appointment payment was successful.' },
+  });
+};
+
 const markPharmacyOrderPaid = async (payment: NonNullable<Awaited<ReturnType<typeof Payment.findOne>>>) => {
   if (!payment.pharmacyOrderId) return false;
   const order = await PharmacyOrder.findOne({
@@ -63,12 +99,33 @@ const markPharmacyOrderPaid = async (payment: NonNullable<Awaited<ReturnType<typ
     { $set: { status: 'PAID' } },
     { new: true },
   );
-  if (updatedOrder) {
-    announcePharmacyOrder(updatedOrder, 'pharmacy.payment-captured');
-    return true;
+  let paidOrder = updatedOrder;
+  if (!paidOrder) {
+    const currentOrder = await PharmacyOrder.findById(order._id).select('_id patientId total status');
+    if (!currentOrder || !pharmacyPaidStatuses.has(currentOrder.status)) return false;
+    paidOrder = currentOrder;
+  } else {
+    announcePharmacyOrder(paidOrder, 'pharmacy.payment-captured');
   }
-  const currentOrder = await PharmacyOrder.findById(order._id).select('status');
-  return Boolean(currentOrder && pharmacyPaidStatuses.has(currentOrder.status));
+  await notifyUsers([paidOrder.patientId.toString()], {
+    event: 'pharmacy.payment-successful',
+    title: 'Medicine payment successful',
+    message: `Your medicine payment of ₹${paidOrder.total.toFixed(2)} was successful.`,
+    metadata: { pharmacyOrderId: paidOrder._id.toString(), total: paidOrder.total },
+    dedupeKey: `pharmacy-payment-success:${paidOrder._id.toString()}`,
+    email: {
+      subject: 'MedSync medicine payment successful',
+      text: `Your medicine payment of ₹${paidOrder.total.toFixed(2)} was successful.`,
+    },
+  });
+  await notifyRole('pharmacist', {
+    event: 'pharmacy.payment-successful',
+    title: 'Patient completed medicine payment',
+    message: `Payment was received for pharmacy order ${paidOrder._id.toString()}.`,
+    metadata: { pharmacyOrderId: paidOrder._id.toString() },
+    dedupeKey: `pharmacy-payment-pharmacist:${paidOrder._id.toString()}`,
+  });
+  return true;
 };
 
 const capturePayment = async (
@@ -118,11 +175,13 @@ const capturePayment = async (
   if (updatedPayment.matchedCount !== 1) return false;
 
   await queueAppointmentConfirmation(appointment.id);
+  await queueAppointmentReminder(appointment.id);
+  await notifyAppointmentPaymentSuccess(appointment, amountPaise);
 
   if (newlyConfirmed) {
-    const doctor = await Doctor.findById(appointment.doctorId).select('userId');
     const event = { appointmentId: appointment.id, status: 'CONFIRMED' };
     publishUserEvent(appointment.patientId.toString(), 'appointment.confirmed', event);
+    const doctor = await Doctor.findById(appointment.doctorId).select('userId');
     if (doctor) publishUserEvent(doctor.userId.toString(), 'appointment.confirmed', event);
     publishAdminEvent('appointment.confirmed', event);
   }
@@ -264,6 +323,15 @@ router.post('/verify', requireAuth, requireRole('patient'), async (req: Authenti
   if (payment.status === 'CAPTURED') {
     if (payment.appointmentId) {
       await queueAppointmentConfirmation(payment.appointmentId.toString());
+      await queueAppointmentReminder(payment.appointmentId.toString());
+      const appointment = await Appointment.findOne({
+        _id: payment.appointmentId,
+        patientId: payment.patientId,
+        status: 'CONFIRMED',
+      }).select('_id patientId doctorId slot');
+      if (appointment) {
+        await notifyAppointmentPaymentSuccess(appointment, payment.amountPaise);
+      }
     }
     if (payment.pharmacyOrderId && !await markPharmacyOrderPaid(payment)) {
       return res.status(409).json({ success: false, message: 'Pharmacy order is not ready to be marked paid.' });
@@ -396,7 +464,10 @@ router.post('/webhook', async (req, res) => {
       { providerOrderId: paymentEntity.order_id, status: 'CREATED' },
       { $set: { status: 'FAILED' } },
     );
-    if (updated.modifiedCount === 1) {
+    if (updated.modifiedCount === 1 || await Payment.exists({
+      providerOrderId: paymentEntity.order_id,
+      status: 'FAILED',
+    })) {
       const payment = await Payment.findOne({ providerOrderId: paymentEntity.order_id }).select('appointmentId pharmacyOrderId patientId');
       if (payment) {
         if (payment.pharmacyOrderId) {
@@ -404,11 +475,57 @@ router.post('/webhook', async (req, res) => {
           publishUserEvent(payment.patientId.toString(), 'pharmacy.payment-failed', eventPayload);
           publishRoleEvent('pharmacist', 'pharmacy.payment-failed', eventPayload);
           publishAdminEvent('pharmacy.payment-failed', eventPayload);
+          await notifyUsers([payment.patientId.toString()], {
+            event: 'pharmacy.payment-failed',
+            title: 'Medicine payment failed',
+            message: 'Your medicine order payment could not be completed. Please try again.',
+            metadata: eventPayload,
+            dedupeKey: `pharmacy-payment-failed-patient:${payment.pharmacyOrderId}`,
+            email: {
+              subject: 'MedSync medicine payment failed',
+              text: 'Your medicine order payment could not be completed. Sign in to MedSync to try again.',
+            },
+          });
+          await notifyRole('admin', {
+            event: 'payment.failed',
+            title: 'Medicine payment failed',
+            message: `Payment failed for pharmacy order ${payment.pharmacyOrderId}.`,
+            metadata: eventPayload,
+            dedupeKey: `pharmacy-payment-failed-admin:${payment.pharmacyOrderId}`,
+            email: {
+              subject: 'MedSync medicine payment failure',
+              text: 'A medicine order payment failed. Review the administration dashboard for details.',
+            },
+          });
         } else if (payment.appointmentId) {
           const eventPayload = { appointmentId: payment.appointmentId.toString(), status: 'PAYMENT_FAILED' };
           const appointment = await Appointment.findById(payment.appointmentId).select('patientId');
           if (appointment) publishUserEvent(appointment.patientId.toString(), 'payment.failed', eventPayload);
           publishAdminEvent('payment.failed', eventPayload);
+          if (appointment) {
+            await notifyUsers([appointment.patientId.toString()], {
+              event: 'payment.failed',
+              title: 'Appointment payment failed',
+              message: 'Your appointment payment could not be completed. Please try again.',
+              metadata: eventPayload,
+              dedupeKey: `appointment-payment-failed-patient:${payment.appointmentId}`,
+              email: {
+                subject: 'MedSync appointment payment failed',
+                text: 'Your appointment payment could not be completed. Sign in to MedSync to try again.',
+              },
+            });
+          }
+          await notifyRole('admin', {
+            event: 'payment.failed',
+            title: 'Appointment payment failed',
+            message: `Payment failed for appointment ${payment.appointmentId}.`,
+            metadata: eventPayload,
+            dedupeKey: `appointment-payment-failed-admin:${payment.appointmentId}`,
+            email: {
+              subject: 'MedSync appointment payment failure',
+              text: 'An appointment payment failed. Review the administration dashboard for details.',
+            },
+          });
         }
       }
     }

@@ -63,6 +63,15 @@ type Order = {
 type InventoryItem = { _id: string; medicine: string; stock: number; lowStock: boolean; lowStockThreshold: number }
 type DeliveryStaff = { _id: string; name: string }
 type ManagedUser = User & { _id: string; isActive: boolean; createdAt: string }
+type UserNotification = {
+  _id: string
+  event: string
+  title: string
+  message: string
+  createdAt: string
+  readAt?: string
+}
+type NotificationsResponse = { notifications: UserNotification[]; unreadCount: number }
 type DashboardData = {
   doctors?: Doctor[]
   appointments?: Appointment[]
@@ -74,6 +83,8 @@ type DashboardData = {
   departments?: DepartmentRecord[]
   auditLogs?: AuditEntry[]
   stats?: Record<string, number>
+  notifications?: UserNotification[]
+  unreadNotificationCount?: number
 }
 
 type RazorpayResult = {
@@ -261,11 +272,11 @@ const loginRoles: { role: Role; label: string }[] = [
 ]
 
 const dashboardEndpoints: Record<Role, string[]> = {
-  patient: ['patients/doctors', 'patients/appointments', 'patients/orders'],
-  doctor: ['doctors/appointments'],
-  admin: ['admin/dashboard', 'admin/users', 'admin/audit-logs'],
-  pharmacist: ['pharmacy/orders', 'pharmacy/inventory', 'pharmacy/delivery-staff'],
-  deliveryBoy: ['delivery/assignments'],
+  patient: ['patients/doctors', 'patients/appointments', 'patients/orders', 'notifications'],
+  doctor: ['doctors/appointments', 'notifications'],
+  admin: ['admin/dashboard', 'admin/users', 'admin/audit-logs', 'notifications'],
+  pharmacist: ['pharmacy/orders', 'pharmacy/inventory', 'pharmacy/delivery-staff', 'notifications'],
+  deliveryBoy: ['delivery/assignments', 'notifications'],
 }
 
 function App() {
@@ -286,8 +297,14 @@ function App() {
       next.doctors = responses[0] as Doctor[]
       next.appointments = responses[1] as Appointment[]
       next.orders = responses[2] as Order[]
+      const notifications = responses[3] as NotificationsResponse
+      next.notifications = notifications.notifications
+      next.unreadNotificationCount = notifications.unreadCount
     } else if (currentUser.role === 'doctor') {
       next.appointments = responses[0] as Appointment[]
+      const notifications = responses[1] as NotificationsResponse
+      next.notifications = notifications.notifications
+      next.unreadNotificationCount = notifications.unreadCount
     } else if (currentUser.role === 'admin') {
       const summary = responses[0] as { stats: Record<string, number>; appointments?: Appointment[]; departments?: DepartmentRecord[] }
       next.stats = summary.stats
@@ -295,12 +312,21 @@ function App() {
       next.departments = summary.departments
       next.users = responses[1] as ManagedUser[]
       next.auditLogs = responses[2] as AuditEntry[]
+      const notifications = responses[3] as NotificationsResponse
+      next.notifications = notifications.notifications
+      next.unreadNotificationCount = notifications.unreadCount
     } else if (currentUser.role === 'pharmacist') {
       next.orders = responses[0] as Order[]
       next.inventory = responses[1] as InventoryItem[]
       next.deliveryStaff = responses[2] as DeliveryStaff[]
+      const notifications = responses[3] as NotificationsResponse
+      next.notifications = notifications.notifications
+      next.unreadNotificationCount = notifications.unreadCount
     } else {
       next.assignments = responses[0] as Order[]
+      const notifications = responses[1] as NotificationsResponse
+      next.notifications = notifications.notifications
+      next.unreadNotificationCount = notifications.unreadCount
     }
     if (requestId === dashboardRequestId.current) setData(next)
   }, [])
@@ -445,6 +471,24 @@ function App() {
     }
   }
 
+  const markNotificationRead = async (notificationId: string) => {
+    try {
+      await api(`notifications/${notificationId}/read`, { method: 'PATCH' })
+      await refresh()
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Could not mark notification as read.')
+    }
+  }
+
+  const markAllNotificationsRead = async () => {
+    try {
+      await api('notifications/read-all', { method: 'PATCH' })
+      await refresh()
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Could not mark notifications as read.')
+    }
+  }
+
   if (loading) return <div className="loading-screen">Connecting to MedSync...</div>
   if (!user) return <Routes>
     <Route path="/login" element={<AuthScreen message={message} setMessage={setMessage} onLogin={async (profile) => {
@@ -476,10 +520,18 @@ function App() {
           <div><p className="eyebrow">{roleTitles[user.role]} workspace</p><h1>Welcome, {user.name.split(' ')[0]}</h1></div>
           <div className="topbar-actions">
             <span className={`live-status${live ? ' connected' : ''}`} role="status">{live ? 'Live updates on' : 'Reconnecting...'}</span>
+            <span className="notification-count" aria-label={`${data.unreadNotificationCount || 0} unread notifications`}>
+              Notifications {data.unreadNotificationCount || 0}
+            </span>
             <button type="button" className="secondary-btn" onClick={() => void signOut()}>Sign out this tab</button>
           </div>
         </header>
         {message && <div className="notice" role="alert">{message}</div>}
+        <NotificationPanel
+          notifications={data.notifications || []}
+          onMarkRead={(id) => void markNotificationRead(id)}
+          onMarkAllRead={() => void markAllNotificationsRead()}
+        />
         <RoleDashboard user={user} data={data} perform={perform} setMessage={setMessage} onJoinVideo={setVideoAppointment} onForbiddenSession={reconcileSession} />
         {videoAppointment && (user.role === 'patient' || user.role === 'doctor') && <VideoConsultation
           appointmentId={videoAppointment._id}
@@ -499,6 +551,32 @@ function App() {
     <Route path="/delivery" element={user.role === 'deliveryBoy' ? dashboard : <Navigate to={rolePaths[user.role]} replace />} />
     <Route path="*" element={<Navigate to={rolePaths[user.role]} replace />} />
   </Routes>
+}
+
+function NotificationPanel({ notifications, onMarkRead, onMarkAllRead }: {
+  notifications: UserNotification[]
+  onMarkRead: (id: string) => void
+  onMarkAllRead: () => void
+}) {
+  return <section className="dashboard-panel notifications-panel" aria-label="Notifications">
+    <div className="section-heading">
+      <h2>Notifications</h2>
+      {notifications.some((item) => !item.readAt) && <button type="button" className="small-btn" onClick={onMarkAllRead}>Mark all read</button>}
+    </div>
+    {!notifications.length
+      ? <p className="empty-state">You’re all caught up.</p>
+      : <div className="record-list">{notifications.map((notification) => <article
+        className={`record notification-record${notification.readAt ? '' : ' unread'}`}
+        key={notification._id}
+      >
+        <div>
+          <strong>{notification.title}</strong>
+          <span>{notification.message}</span>
+          <small>{new Date(notification.createdAt).toLocaleString()}</small>
+        </div>
+        {!notification.readAt && <button type="button" className="small-btn" onClick={() => onMarkRead(notification._id)}>Mark read</button>}
+      </article>)}</div>}
+  </section>
 }
 
 function AuthScreen({ message, setMessage, onLogin }: {
