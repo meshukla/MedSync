@@ -62,7 +62,7 @@ const verifyOtpSchema = z.object({
 const cookieOptions = (maxAge: number, path: string) => ({
   httpOnly: true,
   secure: env.nodeEnv === 'production',
-  sameSite: 'strict' as const,
+  sameSite: env.nodeEnv === 'production' ? 'none' as const : 'strict' as const,
   maxAge,
   path,
 });
