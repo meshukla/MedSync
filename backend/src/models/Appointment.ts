@@ -13,6 +13,7 @@ export type AppointmentDocument = {
   fee: number;
   status: AppointmentStatus;
   consultationType: 'OFFLINE' | 'ONLINE';
+  confirmationNotificationQueuedAt?: Date;
   videoConsultationCompletedAt?: Date;
   rescheduledAt?: Date;
   rescheduleCount: number;
@@ -29,6 +30,7 @@ const appointmentSchema = new Schema<AppointmentDocument>(
     fee: { type: Number, required: true, min: 0 },
     status: { type: String, enum: appointmentStatuses, default: 'PAYMENT_PENDING' },
     consultationType: { type: String, enum: ['OFFLINE', 'ONLINE'], default: 'OFFLINE' },
+    confirmationNotificationQueuedAt: { type: Date },
     videoConsultationCompletedAt: { type: Date },
     rescheduledAt: { type: Date },
     rescheduleCount: { type: Number, min: 0, default: 0 },

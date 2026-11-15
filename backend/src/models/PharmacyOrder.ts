@@ -22,6 +22,7 @@ export type PharmacyOrderDocument = {
   deliveryAddress?: string;
   status: PharmacyOrderStatus;
   total: number;
+  pharmacyNotificationQueuedAt?: Date;
   items: {
     name: string;
     quantity: number;
@@ -46,6 +47,7 @@ const pharmacyOrderSchema = new Schema<PharmacyOrderDocument>(
     deliveryAddress: { type: String, trim: true, maxlength: 500 },
     status: { type: String, enum: pharmacyOrderStatuses, default: 'PRESCRIPTION_RECEIVED' },
     total: { type: Number, required: true, min: 0 },
+    pharmacyNotificationQueuedAt: { type: Date },
     items: [{
       name: { type: String, required: true },
       quantity: { type: Number, required: true, min: 1 },

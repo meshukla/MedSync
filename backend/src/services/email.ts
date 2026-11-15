@@ -26,7 +26,7 @@ const brevoRejectionMessage = async (response: Response, emailType: string) => {
   return `Brevo rejected the ${emailType} email (${response.status}). Check the API key and verified sender configuration.${detailMessage}`;
 };
 
-export const sendVerificationEmail = async (email: string, code: string) => {
+const sendBrevoEmail = async (email: string, emailType: string, subject: string, textContent: string) => {
   if (!env.brevoApiKey || !env.brevoSenderEmail) {
     throw new Error('Brevo API key and verified sender email must be configured.');
   }
@@ -41,12 +41,43 @@ export const sendVerificationEmail = async (email: string, code: string) => {
     body: JSON.stringify({
       sender: { email: env.brevoSenderEmail, name: 'MedSync' },
       to: [{ email }],
-      subject: 'Verify your MedSync email',
-      textContent: `Your MedSync verification code is ${code}. It expires in 10 minutes.`,
+      subject,
+      textContent,
     }),
   });
 
   if (!response.ok) {
-    throw new Error(await brevoRejectionMessage(response, 'verification'));
+    throw new Error(await brevoRejectionMessage(response, emailType));
   }
 };
+
+export const sendVerificationEmail = (email: string, code: string) =>
+  sendBrevoEmail(
+    email,
+    'verification',
+    'Verify your MedSync email',
+    `Your MedSync verification code is ${code}. It expires in 10 minutes.`,
+  );
+
+export const sendAppointmentConfirmationEmail = (email: string, slot: Date) => {
+  const formattedSlot = new Intl.DateTimeFormat('en-IN', {
+    dateStyle: 'long',
+    timeStyle: 'short',
+    timeZone: env.clinicTimeZone,
+  }).format(slot);
+
+  return sendBrevoEmail(
+    email,
+    'appointment confirmation',
+    'Your MedSync appointment is confirmed',
+    `Your MedSync appointment is confirmed for ${formattedSlot} (${env.clinicTimeZone}). Sign in to MedSync to view your appointment details.`,
+  );
+};
+
+export const sendPharmacyPrescriptionNotificationEmail = (email: string) =>
+  sendBrevoEmail(
+    email,
+    'pharmacy prescription notification',
+    'A new prescription is ready in MedSync',
+    'A new prescription is available in the MedSync pharmacy dashboard. Sign in to review it.',
+  );

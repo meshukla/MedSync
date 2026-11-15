@@ -5,9 +5,11 @@ Express + TypeScript API with MongoDB persistence.
 ## First-time setup
 
 1. Copy `.env.example` to `.env`. The backend loads this file relative to its source/build directory, regardless of the launch directory.
-2. Set `MONGODB_URI`, a unique `JWT_ACCESS_SECRET`, `PRESCRIPTION_SIGNING_SECRET`, `CLIENT_URL`, `CLINIC_TIME_ZONE` (defaults to `Asia/Kolkata`), `BREVO_API_KEY` (a Brevo v3 API key, not an SMTP key), `BREVO_SENDER_EMAIL` (a sender verified in Brevo), `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`, and `ADMIN_NAME`, `ADMIN_EMAIL`, `ADMIN_PHONE`, and a unique `ADMIN_PASSWORD` (at least 8 characters). For calls across networks, configure a hospital-operated coturn server with `TURN_URLS` and its `TURN_SHARED_SECRET`; `TURN_CREDENTIAL_TTL_SECONDS` defaults to one hour.
-3. Start MongoDB, then run `npm install`, `npm run create-admin`, and `npm run dev`.
-4. Start the frontend. The initial administrator can create accounts for the other staff roles.
+2. Set `MONGODB_URI`, `REDIS_URL`, a unique `JWT_ACCESS_SECRET`, `PRESCRIPTION_SIGNING_SECRET`, `CLIENT_URL`, `CLINIC_TIME_ZONE` (defaults to `Asia/Kolkata`), `BREVO_API_KEY` (a Brevo v3 API key, not an SMTP key), `BREVO_SENDER_EMAIL` (a sender verified in Brevo), `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`, and `ADMIN_NAME`, `ADMIN_EMAIL`, `ADMIN_PHONE`, and a unique `ADMIN_PASSWORD` (at least 8 characters). Use the exact Redis Cloud URL provided by your Redis provider; keep its credentials out of Git. For calls across networks, configure a hospital-operated coturn server with `TURN_URLS` and its `TURN_SHARED_SECRET`; `TURN_CREDENTIAL_TTL_SECONDS` defaults to one hour.
+3. Start MongoDB and Redis, then run `npm install`, `npm run redis:test`, `npm run create-admin`, and `npm run dev`.
+4. Start the notification worker in a second backend terminal with `npm run worker`, then start the frontend. The initial administrator can create accounts for the other staff roles.
+
+For BullMQ, configure the Redis provider's `maxmemory-policy` as `noeviction`. Policies such as `volatile-lru` can evict queue data under memory pressure; BullMQ warns when it detects one.
 
 The create-admin script refuses to run once any admin account exists. Do not use the example values or development secrets in production. Keep `PRESCRIPTION_SIGNING_SECRET` stable: rotating it prevents verification of prescriptions signed with the previous key. The prescription HMAC is tamper detection, not a certificate-backed or legally qualified electronic signature. Patient registration sends a six-digit email verification code; Brevo must be configured for registration to complete. Access cookies expire after 15 minutes and are refreshed through a rotating, server-tracked refresh session. Cookie-authenticated requests and Socket.IO connections must identify the browser tab with the `X-MedSync-Tab-ID` header or `tabSessionId` handshake value; this selects that tab's HttpOnly cookies and keeps simultaneous role sessions independent. Appointment checkout requires Razorpay keys; configure the Razorpay webhook URL as `/api/v1/payments/webhook` and subscribe to payment capture/failure events.
 
@@ -18,6 +20,10 @@ The create-admin script refuses to run once any admin account exists. Do not use
 - `npm run start` - start the compiled server
 - `npm run lint` - run TypeScript validation
 - `npm run create-admin` - create the first administrator from environment values
+- `npm run redis:test` - verify Redis SET/GET access
+- `npm run worker` - start the BullMQ notification worker in watch mode
+- `npm run worker:start` - start the compiled worker after `npm run build`
+- `npm run queue:test` - enqueue a non-sensitive health-check job; requires `npm run worker` in another terminal
 
 ## API
 
@@ -50,4 +56,4 @@ Audio/video media connects peer-to-peer when the network allows it, or through t
 
 The assigned doctor can submit one prescription per appointment. Online consultations must be finished first. The endpoint requires a confirmed appointment and captured consultation payment; a delivery address is only required when the patient chooses delivery. It records the doctor identity and signs the prescription payload with HMAC-SHA256, creates the pharmacy order, and marks the appointment complete. This signature is tamper detection, not a certificate-backed or legally qualified signature.
 
-The pharmacy verifies the signature and prescription/order item match before checking inventory and generating a bill. The patient initiates Razorpay checkout for their bill; server-side payment verification or a signed Razorpay webhook transitions the order to `PAID`. Stock is deducted once when preparation starts. Pharmacists can mark orders collected without a pickup code, and assigned delivery staff can mark orders delivered without a delivery code. Delivery dispatch requires an address and snapshots it onto the order so later patient profile edits do not change an existing delivery. Refund completion depends on configured Razorpay keys and webhook delivery. AWS S3, Redis, and BullMQ integrations are not enabled by this version.
+The pharmacy verifies the signature and prescription/order item match before checking inventory and generating a bill. The patient initiates Razorpay checkout for their bill; server-side payment verification or a signed Razorpay webhook transitions the order to `PAID`. Stock is deducted once when preparation starts. Pharmacists can mark orders collected without a pickup code, and assigned delivery staff can mark orders delivered without a delivery code. Delivery dispatch requires an address and snapshots it onto the order so later patient profile edits do not change an existing delivery. Refund completion depends on configured Razorpay keys and webhook delivery. Appointment confirmations are queued after payment capture or doctor confirmation and sent to the patient's email by the BullMQ worker. New prescriptions enqueue one generic email notification per active pharmacist. Registration OTP email remains synchronous; delivery notifications, appointment reminders, slot caching, and Redis locks are not yet integrated.

@@ -3,6 +3,20 @@ import { resolve } from 'node:path';
 
 dotenv.config({ path: resolve(__dirname, '../../.env') });
 
+const configuredRedisUrl = process.env.REDIS_URL?.trim() || 'redis://localhost:6379';
+let parsedRedisUrl: URL;
+try {
+  parsedRedisUrl = new URL(configuredRedisUrl);
+} catch {
+  throw new Error('REDIS_URL must contain only a valid redis:// or rediss:// connection URL.');
+}
+if (
+  (parsedRedisUrl.protocol !== 'redis:' && parsedRedisUrl.protocol !== 'rediss:')
+  || !parsedRedisUrl.hostname
+) {
+  throw new Error('REDIS_URL must contain only a valid redis:// or rediss:// connection URL.');
+}
+
 const turnUrls = (process.env.TURN_URLS || '').split(',').map((url) => url.trim()).filter(Boolean);
 const turnSharedSecret = process.env.TURN_SHARED_SECRET || '';
 const configuredTurnTtl = process.env.TURN_CREDENTIAL_TTL_SECONDS
@@ -21,7 +35,7 @@ export const env = {
   nodeEnv: process.env.NODE_ENV || 'development',
   jwtAccessSecret: process.env.JWT_ACCESS_SECRET || 'dev-access-secret',
   mongoUri: process.env.MONGODB_URI || 'mongodb://localhost:27017/medsync',
-  redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
+  redisUrl: configuredRedisUrl,
   clientUrl: process.env.CLIENT_URL || 'http://localhost:5173',
   clinicTimeZone: process.env.CLINIC_TIME_ZONE || 'Asia/Kolkata',
   turnUrls,

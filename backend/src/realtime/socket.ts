@@ -288,6 +288,13 @@ export const initializeRealtime = (httpServer: HttpServer) => {
   });
 };
 
+export const closeRealtime = async () => {
+  if (!io) return;
+  const realtimeServer = io;
+  io = undefined;
+  await realtimeServer.close();
+};
+
 export const disconnectSessionFamily = (familyId: string) => {
   if (!io) throw new Error('Realtime service has not been initialized.');
   io.in(`session:${familyId}`).disconnectSockets(true);

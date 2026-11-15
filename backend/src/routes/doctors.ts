@@ -8,6 +8,10 @@ import { Prescription } from '../models/Prescription';
 import { User } from '../models/User';
 import { requireAuth, AuthenticatedRequest, requireRole } from '../middleware/auth';
 import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realtime/socket';
+import {
+  queueAppointmentConfirmation,
+  queuePharmacyPrescriptionNotifications,
+} from '../services/notifications';
 import { recordAudit } from '../utils/audit';
 import { signPrescription } from '../utils/prescriptionSignature';
 import { successResponse } from '../utils/response';
@@ -112,6 +116,22 @@ router.post('/appointments/:id/prescription', requireAuth, requireRole('doctor')
   if (!doctor) {
     return res.status(404).json({ success: false, message: 'Doctor profile not found.' });
   }
+  const existingPrescription = await Prescription.findOne({
+    appointmentId: appointmentId.data,
+    doctorId: doctor._id,
+  });
+  if (existingPrescription) {
+    const existingOrder = await PharmacyOrder.findOne({ prescriptionId: existingPrescription._id }).select('_id');
+    if (!existingOrder) {
+      return res.status(409).json({ success: false, message: 'A prescription already exists for this appointment.' });
+    }
+    await queuePharmacyPrescriptionNotifications(existingOrder.id);
+    return res.json(successResponse('Prescription already submitted to the pharmacy.', {
+      prescriptionId: existingPrescription.id,
+      pharmacyOrderId: existingOrder.id,
+    }));
+  }
+
   const appointment = await Appointment.findOne({
     _id: appointmentId.data,
     doctorId: doctor._id,
@@ -122,9 +142,6 @@ router.post('/appointments/:id/prescription', requireAuth, requireRole('doctor')
   }
   if (appointment.consultationType === 'ONLINE' && !appointment.videoConsultationCompletedAt) {
     return res.status(409).json({ success: false, message: 'Finish the video consultation before signing its prescription.' });
-  }
-  if (await Prescription.exists({ appointmentId: appointment._id })) {
-    return res.status(409).json({ success: false, message: 'A prescription has already been signed for this appointment.' });
   }
   if (!await Payment.exists({ appointmentId: appointment._id, status: 'CAPTURED' })) {
     return res.status(409).json({ success: false, message: 'The consultation payment must be confirmed before prescribing.' });
@@ -195,6 +212,8 @@ router.post('/appointments/:id/prescription', requireAuth, requireRole('doctor')
     throw error;
   }
 
+  await queuePharmacyPrescriptionNotifications(pharmacyOrder.id);
+
   const event = {
     appointmentId: appointment.id,
     pharmacyOrderId: pharmacyOrder.id,
@@ -242,13 +261,25 @@ router.patch('/appointments/:id/status', requireAuth, requireRole('doctor'), asy
     return res.status(409).json({ success: false, message: 'Paid appointments must be cancelled through the hospital.' });
   }
 
-  const appointment = await Appointment.findOneAndUpdate(
+  let appointment = await Appointment.findOneAndUpdate(
     { _id: req.params.id, doctorId: doctor.id, status: { $in: allowedFrom[parsed.data.status] } },
     { $set: { status: parsed.data.status } },
     { new: true },
   );
+  if (!appointment && parsed.data.status === 'CONFIRMED') {
+    appointment = await Appointment.findOne({
+      _id: req.params.id,
+      doctorId: doctor.id,
+      status: 'CONFIRMED',
+      confirmationNotificationQueuedAt: { $exists: false },
+    });
+  }
   if (!appointment) {
     return res.status(404).json({ success: false, message: 'Appointment not found or the status has changed.' });
+  }
+
+  if (appointment.status === 'CONFIRMED') {
+    await queueAppointmentConfirmation(appointment.id);
   }
 
   const eventName = `appointment.${appointment.status.toLowerCase()}`;

@@ -8,6 +8,7 @@ import { Payment } from '../models/Payment';
 import { AuditLog } from '../models/AuditLog';
 import { PharmacyOrder } from '../models/PharmacyOrder';
 import { Doctor } from '../models/Clinic';
+import { queueAppointmentConfirmation } from '../services/notifications';
 import { publishAdminEvent, publishRoleEvent, publishUserEvent } from '../realtime/socket';
 import { getRazorpayClient, PaymentConfigurationError } from '../services/razorpay';
 import { successResponse } from '../utils/response';
@@ -115,6 +116,8 @@ const capturePayment = async (
     { $set: { status: 'CAPTURED', providerPaymentId, capturedAt: new Date() } },
   );
   if (updatedPayment.matchedCount !== 1) return false;
+
+  await queueAppointmentConfirmation(appointment.id);
 
   if (newlyConfirmed) {
     const doctor = await Doctor.findById(appointment.doctorId).select('userId');
@@ -259,6 +262,9 @@ router.post('/verify', requireAuth, requireRole('patient'), async (req: Authenti
     return res.status(404).json({ success: false, message: 'Payment order not found.' });
   }
   if (payment.status === 'CAPTURED') {
+    if (payment.appointmentId) {
+      await queueAppointmentConfirmation(payment.appointmentId.toString());
+    }
     if (payment.pharmacyOrderId && !await markPharmacyOrderPaid(payment)) {
       return res.status(409).json({ success: false, message: 'Pharmacy order is not ready to be marked paid.' });
     }
